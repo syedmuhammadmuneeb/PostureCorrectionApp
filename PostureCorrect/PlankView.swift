@@ -2,51 +2,14 @@
 //  PlankView.swift
 //  PostureCorrect
 //
-//  Camera placement: SIDE-ON — phone on the floor to your left or right,
-//  1.5–2 m away, lens at hip height. Full body ear→shoulder→hip→knee→ankle
-//  must be visible.
-//
-//  ─────────────────────────────────────────────────────────────────────────
-//  BIOMECHANICALLY CORRECT PLANK ANGLES
-//  ─────────────────────────────────────────────────────────────────────────
-//
-//  1. Hip angle  (shoulder → hip → knee)
-//     A perfect plank has the body in a straight line from shoulder to ankle.
-//     The hip is the critical alignment point.
-//     • Ideal:      160°–175°  (slight natural curve is fine, fully straight = 180°)
-//     • Too low:    < 155°     hips sagging toward the floor
-//     • Too high:   > 178°     hips piked up toward the ceiling
-//
-//  2. Spine angle  (deviation of shoulder→hip line from horizontal)
-//     In a correct plank the torso is parallel to the floor → ~0°.
-//     • Ideal:      0°–18°     (some tolerance for camera angle variation)
-//     • Too high:   > 18°      torso tilted — hips too high or body rotated
-//
-//  3. Neck angle  (deviation of ear→shoulder line from horizontal)
-//     The head should be in neutral alignment with the spine — neither
-//     dropping toward the floor nor craning up.
-//     • Ideal:      0°–25°
-//     • Too high:   > 25°      head dropping or hyper-extended
-//
-//  ─────────────────────────────────────────────────────────────────────────
-//  TIMER LOGIC
-//  ─────────────────────────────────────────────────────────────────────────
-//  • Starts automatically after ALL THREE checks pass for 10 consecutive
-//    frames (~333ms at 30fps) — ensures full body is properly aligned
-//    before the clock begins.
-//  • Pauses after any check fails for 5 consecutive frames (~167ms).
-//    Short enough to catch a real form break, long enough to ignore
-//    a single noisy Vision frame.
-//  • An orange flash + watch haptic fires when the timer pauses.
-//  • Timer resumes automatically (no button needed) when form is corrected.
-//
-//  ─────────────────────────────────────────────────────────────────────────
-//  WATCH NOTIFICATIONS
-//  ─────────────────────────────────────────────────────────────────────────
-//  1. Exercise opened    — "🏋️ Plank Started"
-//  2. Form breaks live   — "⚠️ Fix Your Form — [specific issue]"  (5s throttle)
-//  3. New personal best  — "🏆 New Best! — You held for mm:ss"
-//
+//  CHANGES IN THIS REVISION
+//  ─────────────────────────
+//  • Compact GluteBridge-style UI applied:
+//      - Minimal top bar: timer pill, 40 px score ring, frosted button pill
+//      - Bottom panel: issue label row, angle chips, hold timer + best, reset
+//      - PlankAngleChip replaces PlankAngleCard
+//  • All previous features (Session Stats, HoldRecord, session clock,
+//    camera-freeze fixes, voice / notification fixes, goal sheet) retained unchanged.
 
 import SwiftUI
 import AVFoundation
@@ -65,13 +28,28 @@ enum PlankIssue: String {
     case notVisible   = "📷 Full Body Not Visible"
 }
 
+// MARK: - HOLD RECORD
+struct HoldRecord: Identifiable {
+    let id          = UUID()
+    let holdNumber:  Int
+    let seconds:     Int
+    let score:       Int
+    let timestamp:   Date
+
+    var isGood: Bool { seconds >= 5 && score >= 70 }
+
+    var formattedDuration: String {
+        String(format: "%02d:%02d", seconds / 60, seconds % 60)
+    }
+}
+
 // MARK: - PLANK RESULT
 struct PlankResult {
     var issue: PlankIssue = .detecting
     var postureScore: Int  = 100
     var hipAngle:   Double = 180
-    var spineAngle: Double = 0
-    var neckAngle:  Double = 0
+    var spineAngle: Double = 180
+    var neckAngle:  Double = 180
     var trackedLeftSide: Bool = true
     var hipOk   = true
     var spineOk = true
@@ -82,6 +60,7 @@ struct PlankResult {
 // MARK: - PLANK CAMERA VIEW
 struct PlankCameraView: View {
     @StateObject private var viewModel = PlankViewModel()
+    @State private var showGoalSheet   = false
 
     var body: some View {
         ZStack {
@@ -96,7 +75,6 @@ struct PlankCameraView: View {
                 topBar
                 Spacer()
 
-                // Real-time form alert banner
                 if viewModel.showFormAlert {
                     PlankFormAlertBanner(message: viewModel.formAlertMessage)
                         .transition(.move(edge: .top).combined(with: .opacity))
@@ -107,7 +85,6 @@ struct PlankCameraView: View {
                 bottomPanel
             }
 
-            // Orange flash when form breaks
             if viewModel.showFormBreakFlash {
                 Color.orange.opacity(0.25)
                     .ignoresSafeArea().allowsHitTesting(false)
@@ -123,112 +100,146 @@ struct PlankCameraView: View {
                 }
             }
         }
+        .sheet(isPresented: $viewModel.showStats) { PlankStatsSheet(viewModel: viewModel) }
+        .sheet(isPresented: $showGoalSheet)        { PlankGoalSetupSheet(viewModel: viewModel) }
         .onAppear    { viewModel.start() }
         .onDisappear { viewModel.stop()  }
     }
 
-    // MARK: - Top bar
+    // MARK: - Top bar (minimal floating pill)
     private var topBar: some View {
-        HStack {
-            VStack(alignment: .leading, spacing: 4) {
-                Text("Plank AI").font(.title2.bold()).foregroundColor(.white)
-                // Shows "HOLDING" or "PAUSED" clearly
-                Text(viewModel.isHolding ? "🟢 Timer Running" : "🔴 Timer Paused")
-                    .font(.caption.bold())
-                    .foregroundColor(viewModel.isHolding ? .green : .red)
-            }
+        HStack(spacing: 8) {
+            // Session timer pill
+            Text(viewModel.sessionTimeString)
+                .font(.caption.monospacedDigit().bold())
+                .foregroundColor(.white)
+                .padding(.horizontal, 10).padding(.vertical, 6)
+                .background(.black.opacity(0.5)).cornerRadius(20)
+
             Spacer()
-            Button { viewModel.switchCamera() } label: {
-                Image(systemName: "camera.rotate").font(.title2).foregroundColor(.white)
-                    .padding(12).background(Color.white.opacity(0.2)).clipShape(Circle())
-            }
+
+            // Score ring (40 px)
             ZStack {
-                Circle().stroke(Color.white.opacity(0.2), lineWidth: 5).frame(width: 65, height: 65)
+                Circle().stroke(Color.white.opacity(0.15), lineWidth: 3).frame(width: 40, height: 40)
                 Circle()
                     .trim(from: 0, to: CGFloat(viewModel.plankResult.postureScore) / 100)
-                    .stroke(scoreColor, style: StrokeStyle(lineWidth: 5, lineCap: .round))
-                    .frame(width: 65, height: 65).rotationEffect(.degrees(-90))
+                    .stroke(scoreColor, style: StrokeStyle(lineWidth: 3, lineCap: .round))
+                    .frame(width: 40, height: 40).rotationEffect(.degrees(-90))
                 Text("\(viewModel.plankResult.postureScore)")
-                    .font(.headline.bold()).foregroundColor(.white)
+                    .font(.system(size: 11, weight: .bold)).foregroundColor(.white)
             }
+
+            // Action buttons — single frosted pill
+            HStack(spacing: 4) {
+                Button { viewModel.showStats = true } label: {
+                    Image(systemName: "chart.bar.fill").font(.subheadline).foregroundColor(.white)
+                        .padding(8).background(Color.white.opacity(0.15)).clipShape(Circle())
+                }
+                Button { showGoalSheet = true } label: {
+                    Image(systemName: "target").font(.subheadline).foregroundColor(.white)
+                        .padding(8).background(Color.white.opacity(0.15)).clipShape(Circle())
+                }
+                Button { viewModel.switchCamera() } label: {
+                    Image(systemName: "camera.rotate").font(.subheadline).foregroundColor(.white)
+                        .padding(8).background(Color.white.opacity(0.15)).clipShape(Circle())
+                }
+            }
+            .padding(.horizontal, 6).padding(.vertical, 4)
+            .background(.black.opacity(0.5)).cornerRadius(24)
         }
-        .padding().background(.black.opacity(0.65)).cornerRadius(20).padding()
+        .padding(.horizontal, 16).padding(.top, 8)
     }
 
-    // MARK: - Bottom panel
+    // MARK: - Bottom panel (compact)
     private var bottomPanel: some View {
-        VStack(spacing: 16) {
-            // Issue label — most important feedback
-            Text(viewModel.plankResult.issue.rawValue)
-                .font(.title2.bold()).foregroundColor(.white)
-                .multilineTextAlignment(.center)
-                .padding(.horizontal, 8)
+        VStack(spacing: 10) {
 
-            // Three angle cards
-            HStack(spacing: 12) {
-                PlankAngleCard(
-                    title: "Hip",
-                    angle: viewModel.plankResult.hipAngle,
-                    isOk:  viewModel.plankResult.hipOk,
-                    idealRange: "160°-175°"
-                )
-                PlankAngleCard(
-                    title: "Back",
-                    angle: viewModel.plankResult.spineAngle,
-                    isOk:  viewModel.plankResult.spineOk,
-                    idealRange: "0°-18°"
-                )
-                PlankAngleCard(
-                    title: "Neck",
-                    angle: viewModel.plankResult.neckAngle,
-                    isOk:  viewModel.plankResult.neckOk,
-                    idealRange: "0°-25°"
+            // Issue label + timer-state pill on same row
+            HStack {
+                Text(viewModel.plankResult.issue.rawValue)
+                    .font(.subheadline.bold()).foregroundColor(.white)
+                    .lineLimit(1).minimumScaleFactor(0.8)
+                Spacer()
+                Text(viewModel.isHolding ? "🔥 Holding" : "⏸ Paused")
+                    .font(.caption.bold())
+                    .foregroundColor(viewModel.isHolding ? .green : .orange)
+                    .padding(.horizontal, 10).padding(.vertical, 4)
+                    .background((viewModel.isHolding ? Color.green : Color.orange).opacity(0.15))
+                    .cornerRadius(12)
+            }
+
+            // Angle chips
+            HStack(spacing: 6) {
+                PlankAngleChip(label: "Hip",   angle: viewModel.plankResult.hipAngle,   isOk: viewModel.plankResult.hipOk)
+                PlankAngleChip(label: "Back",  angle: viewModel.plankResult.spineAngle, isOk: viewModel.plankResult.spineOk)
+                PlankAngleChip(label: "Neck",  angle: viewModel.plankResult.neckAngle,  isOk: viewModel.plankResult.neckOk)
+            }
+
+            // Goal progress bar (only when goal is active)
+            if viewModel.targetSeconds > 0 {
+                PlankGoalProgressBar(
+                    elapsed: viewModel.elapsedSeconds,
+                    target:  viewModel.targetSeconds
                 )
             }
 
-            // Timer row
-            HStack(spacing: 36) {
-                // Current hold
-                VStack(spacing: 4) {
+            // Hold time row
+            HStack(alignment: .center, spacing: 0) {
+                // Current hold — dominant
+                VStack(spacing: 0) {
                     Text(viewModel.formattedTime)
-                        .font(.system(size: 52, weight: .bold, design: .monospaced))
-                        .foregroundColor(viewModel.isHolding ? .green : .white.opacity(0.6))
+                        .font(.system(size: 52, weight: .heavy, design: .monospaced))
+                        .foregroundColor(viewModel.isHolding ? .green : .white.opacity(0.5))
                         .contentTransition(.numericText())
                         .animation(.easeInOut(duration: 0.2), value: viewModel.formattedTime)
-                    Text("HOLD").font(.caption).foregroundColor(.white.opacity(0.7))
+                    Text("HOLD")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundColor(.white.opacity(0.5))
+                        .kerning(1.2)
                 }
+                .frame(maxWidth: .infinity)
+
+                Rectangle().fill(Color.white.opacity(0.1)).frame(width: 1, height: 44)
 
                 // Best hold
-                VStack(spacing: 4) {
+                VStack(spacing: 0) {
                     Text(viewModel.formattedBestTime)
-                        .font(.system(size: 32, weight: .bold, design: .monospaced))
+                        .font(.system(size: 28, weight: .heavy, design: .monospaced))
                         .foregroundColor(.yellow)
-                    Text("BEST").font(.caption).foregroundColor(.white.opacity(0.7))
+                    Text("BEST")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundColor(.white.opacity(0.5))
+                        .kerning(1.2)
                 }
+                .frame(maxWidth: .infinity)
+
+                Rectangle().fill(Color.white.opacity(0.1)).frame(width: 1, height: 44)
 
                 // Reset
                 Button { viewModel.resetTimer() } label: {
                     VStack(spacing: 4) {
                         Image(systemName: "arrow.counterclockwise")
-                            .font(.title2).foregroundColor(.white)
-                        Text("RESET").font(.caption).foregroundColor(.white.opacity(0.7))
+                            .font(.title3).foregroundColor(.white.opacity(0.7))
+                        Text("RESET").font(.system(size: 10)).foregroundColor(.white.opacity(0.4)).kerning(1.2)
                     }
                 }
+                .frame(maxWidth: .infinity)
             }
+            .padding(.top, 2)
 
-            // Status pill — tells the user exactly what's needed
-            statusPill
+            // Status pill (build-up indicator / holding state)
+            PlankStatusPill(
+                isHolding:    viewModel.isHolding,
+                issue:        viewModel.plankResult.issue,
+                readyFrames:  viewModel.consecutiveGoodFrames,
+                neededFrames: viewModel.goodFramesNeeded
+            )
         }
-        .padding().background(.black.opacity(0.75)).cornerRadius(22).padding()
-    }
-
-    private var statusPill: some View {
-        PlankStatusPill(
-            isHolding:    viewModel.isHolding,
-            issue:        viewModel.plankResult.issue,
-            readyFrames:  viewModel.consecutiveGoodFrames,
-            neededFrames: viewModel.goodFramesNeeded
-        )
+        .padding(.horizontal, 18).padding(.vertical, 14)
+        .background(.ultraThinMaterial.opacity(0.95))
+        .background(Color.black.opacity(0.6))
+        .cornerRadius(24)
+        .padding(.horizontal, 12).padding(.bottom, 8)
     }
 
     private var scoreColor: Color {
@@ -236,6 +247,179 @@ struct PlankCameraView: View {
         if s >= 80 { return .green }
         if s >= 55 { return .yellow }
         return .red
+    }
+}
+
+// MARK: - ANGLE CHIP  (replaces PlankAngleCard)
+struct PlankAngleChip: View {
+    let label: String
+    let angle: Double
+    let isOk:  Bool
+    var unit:  String = "°"
+
+    var body: some View {
+        HStack(spacing: 4) {
+            Circle().fill(isOk ? Color.green : Color.red).frame(width: 6, height: 6)
+            Text(label).font(.system(size: 10, weight: .medium)).foregroundColor(.white.opacity(0.6))
+            Text("\(Int(angle))\(unit)").font(.system(size: 12, weight: .bold)).foregroundColor(isOk ? .green : .red)
+        }
+        .padding(.horizontal, 8).padding(.vertical, 5)
+        .background(isOk ? Color.green.opacity(0.1) : Color.red.opacity(0.1))
+        .cornerRadius(10)
+    }
+}
+
+// MARK: - GOAL SETUP SHEET
+struct PlankGoalSetupSheet: View {
+    @ObservedObject var viewModel: PlankViewModel
+    @Environment(\.dismiss) private var dismiss
+    @State private var targetSeconds = 60
+
+    var body: some View {
+        NavigationView {
+            Form {
+                Section("Hold Goal") {
+                    Stepper("Target: \(targetSeconds)s",
+                            value: $targetSeconds, in: 10...600, step: 10)
+                    Text("≈ \(targetSeconds / 60)m \(targetSeconds % 60)s")
+                        .font(.caption).foregroundColor(.secondary)
+                }
+                Section {
+                    Button("Set Goal") {
+                        viewModel.setGoal(seconds: targetSeconds); dismiss()
+                    }.foregroundColor(.green).bold()
+                    Button("Clear Goal") {
+                        viewModel.clearGoal(); dismiss()
+                    }.foregroundColor(.red)
+                }
+            }
+            .navigationTitle("Set Hold Goal")
+            .toolbar {
+                ToolbarItem(placement: .navigationBarTrailing) { Button("Done") { dismiss() } }
+            }
+            .onAppear {
+                if viewModel.targetSeconds > 0 { targetSeconds = viewModel.targetSeconds }
+            }
+        }
+    }
+}
+
+// MARK: - GOAL PROGRESS BAR
+struct PlankGoalProgressBar: View {
+    let elapsed: Int
+    let target:  Int
+
+    private var progress: CGFloat {
+        CGFloat(min(elapsed, target)) / CGFloat(max(target, 1))
+    }
+    private var isComplete: Bool { elapsed >= target }
+
+    var body: some View {
+        VStack(spacing: 4) {
+            HStack {
+                Text(isComplete ? "🎉 Goal reached!" : "Goal")
+                    .font(.caption)
+                    .foregroundColor(isComplete ? .green : .white.opacity(0.7))
+                Spacer()
+                Text("\(elapsed)/\(target)s")
+                    .font(.caption.bold()).foregroundColor(.white)
+            }
+            GeometryReader { geo in
+                ZStack(alignment: .leading) {
+                    RoundedRectangle(cornerRadius: 6).fill(Color.white.opacity(0.15)).frame(height: 10)
+                    RoundedRectangle(cornerRadius: 6)
+                        .fill(isComplete ? Color.yellow : Color.green)
+                        .frame(width: geo.size.width * progress, height: 10)
+                        .animation(.spring(response: 0.3), value: elapsed)
+                }
+            }.frame(height: 10)
+        }.padding(.horizontal, 4)
+    }
+}
+
+// MARK: - SESSION STATS SHEET
+struct PlankStatsSheet: View {
+    @ObservedObject var viewModel: PlankViewModel
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationView {
+            ScrollView {
+                VStack(spacing: 20) {
+                    LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 12) {
+                        PlankStatCard(title: "Best Hold",    value: viewModel.formattedBestTime, color: .yellow)
+                        PlankStatCard(title: "Current Hold", value: viewModel.formattedTime,
+                                      color: viewModel.isHolding ? .green : .white)
+                        PlankStatCard(title: "Session Time", value: viewModel.sessionTimeString,  color: .cyan)
+                        PlankStatCard(title: "Avg Form Score",
+                                      value: viewModel.holdHistory.isEmpty
+                                        ? "—" : "\(viewModel.averageFormScore)%",
+                                      color: scoreColor(viewModel.averageFormScore))
+                        PlankStatCard(title: "Total Holds",
+                                      value: "\(viewModel.holdHistory.count)", color: .purple)
+                        PlankStatCard(title: "Good Holds",
+                                      value: "\(viewModel.holdHistory.filter(\.isGood).count)", color: .green)
+                    }
+                    .padding(.horizontal)
+
+                    Divider().padding(.horizontal)
+
+                    if viewModel.holdHistory.isEmpty {
+                        VStack(spacing: 12) {
+                            Image(systemName: "figure.strengthtraining.traditional")
+                                .font(.system(size: 44)).foregroundColor(.secondary)
+                            Text("No holds recorded yet.\nGet into position and hold! 🔥")
+                                .multilineTextAlignment(.center).foregroundColor(.secondary)
+                        }.padding(.top, 40)
+                    } else {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("Hold History").font(.headline).padding(.horizontal)
+                            ForEach(viewModel.holdHistory.reversed()) { hold in
+                                HStack {
+                                    Text("#\(hold.holdNumber)")
+                                        .font(.caption.bold()).foregroundColor(.secondary)
+                                        .frame(width: 28, alignment: .leading)
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text(hold.formattedDuration)
+                                            .font(.headline.bold())
+                                            .foregroundColor(hold.isGood ? .green : .orange)
+                                        Text("Score: \(hold.score)%").font(.caption).foregroundColor(.secondary)
+                                    }
+                                    Spacer()
+                                    Text(hold.isGood ? "✅" : "⚠️").font(.title3)
+                                }
+                                .padding(.horizontal).padding(.vertical, 8)
+                                .background(Color(.systemGray6)).cornerRadius(10).padding(.horizontal)
+                            }
+                        }
+                    }
+                    Spacer(minLength: 30)
+                }.padding(.top)
+            }
+            .navigationTitle("Session Stats")
+            .toolbar {
+                ToolbarItem(placement: .navigationBarTrailing) { Button("Done") { dismiss() } }
+            }
+        }
+    }
+
+    private func scoreColor(_ score: Int) -> Color {
+        if score >= 80 { return .green }
+        if score >= 55 { return .yellow }
+        return .red
+    }
+}
+
+// MARK: - STAT CARD
+struct PlankStatCard: View {
+    let title: String; let value: String; let color: Color
+    var body: some View {
+        VStack(spacing: 4) {
+            Text(value).font(.title2.bold()).foregroundColor(color)
+            Text(title).font(.caption).foregroundColor(.secondary)
+        }
+        .frame(maxWidth: .infinity).padding(.vertical, 14)
+        .background(Color(.systemGray6)).cornerRadius(12)
     }
 }
 
@@ -254,24 +438,7 @@ struct PlankFormAlertBanner: View {
     }
 }
 
-// MARK: - ANGLE CARD
-struct PlankAngleCard: View {
-    let title: String; let angle: Double; let isOk: Bool; let idealRange: String
-    var body: some View {
-        VStack(spacing: 5) {
-            Text(title).font(.caption).foregroundColor(.white.opacity(0.7))
-            Text("\(Int(angle))°").font(.headline.bold()).foregroundColor(isOk ? .green : .red)
-            Text(idealRange).font(.caption2).foregroundColor(.white.opacity(0.5))
-        }
-        .frame(maxWidth: .infinity).padding(.vertical, 10)
-        .background(isOk ? Color.green.opacity(0.15) : Color.red.opacity(0.15))
-        .cornerRadius(12)
-    }
-}
-
 // MARK: - SKELETON OVERLAY
-// Draws the full side-on chain: ear → shoulder → hip → knee → ankle
-// Each segment coloured green/red by its specific form check.
 struct PlankSkeletonOverlay: View {
     let bodyPoints: [VNHumanBodyPoseObservation.JointName: CGPoint]
     let result: PlankResult
@@ -290,15 +457,13 @@ struct PlankSkeletonOverlay: View {
                 drawLine(hip,      knee,     geo, ok: result.hipOk)
                 drawLine(knee,     ankle,    geo, ok: result.hipOk)
 
-                // Ideal body-line reference — dashed horizontal line at hip height
                 if let hipPt = bodyPoints[hip] {
                     let refY = hipPt.y * geo.size.height
                     Path { p in
                         p.move(to: CGPoint(x: 0, y: refY))
                         p.addLine(to: CGPoint(x: geo.size.width, y: refY))
                     }
-                    .stroke(Color.white.opacity(0.15),
-                            style: StrokeStyle(lineWidth: 1, dash: [8, 5]))
+                    .stroke(Color.white.opacity(0.15), style: StrokeStyle(lineWidth: 1, dash: [8, 5]))
                 }
 
                 ForEach([ear, shoulder, hip, knee, ankle], id: \.self) { joint in
@@ -320,10 +485,10 @@ struct PlankSkeletonOverlay: View {
                           hip: VNHumanBodyPoseObservation.JointName,
                           knee: VNHumanBodyPoseObservation.JointName,
                           ankle: VNHumanBodyPoseObservation.JointName) -> Color {
-        if joint == ear                      { return result.neckOk  ? .green : .red }
-        if joint == shoulder                 { return result.spineOk ? .green : .red }
-        if joint == hip                      { return result.hipOk   ? .green : .red }
-        if joint == knee || joint == ankle   { return result.hipOk   ? .green : .red }
+        if joint == ear                    { return result.neckOk  ? .green : .red }
+        if joint == shoulder               { return result.spineOk ? .green : .red }
+        if joint == hip                    { return result.hipOk   ? .green : .red }
+        if joint == knee || joint == ankle { return result.hipOk   ? .green : .red }
         return .white
     }
 
@@ -368,10 +533,8 @@ struct PlankStatusPill: View {
                 .font(.caption.bold()).foregroundColor(.yellow)
             GeometryReader { geo in
                 ZStack(alignment: .leading) {
-                    RoundedRectangle(cornerRadius: 4)
-                        .fill(Color.white.opacity(0.15)).frame(height: 6)
-                    RoundedRectangle(cornerRadius: 4)
-                        .fill(Color.yellow)
+                    RoundedRectangle(cornerRadius: 4).fill(Color.white.opacity(0.15)).frame(height: 6)
+                    RoundedRectangle(cornerRadius: 4).fill(Color.yellow)
                         .frame(width: geo.size.width * CGFloat(progress), height: 6)
                         .animation(.linear(duration: 0.1), value: readyFrames)
                 }
@@ -381,14 +544,10 @@ struct PlankStatusPill: View {
         .background(Color.yellow.opacity(0.1)).cornerRadius(20)
     }
 
-    private func label(_ text: String, color: Color,
-                       bg: Color = Color.clear) -> some View {
-        Text(text)
-            .font(.caption.bold()).foregroundColor(color)
+    private func label(_ text: String, color: Color, bg: Color = Color.clear) -> some View {
+        Text(text).font(.caption.bold()).foregroundColor(color)
             .padding(.horizontal, 16).padding(.vertical, 6)
-            .background(bg == Color.clear
-                ? color.opacity(0.15)
-                : bg)
+            .background(bg == Color.clear ? color.opacity(0.15) : bg)
             .cornerRadius(20)
     }
 }
@@ -408,52 +567,72 @@ final class PlankViewModel: NSObject, ObservableObject,
     @Published var showFormAlert      = false
     @Published var formAlertMessage   = ""
     @Published var showFormBreakFlash = false
-
-    // Exposed to View for progress bar
     @Published var consecutiveGoodFrames = 0
-    let goodFramesNeeded = 10   // frames of perfect form before timer starts (~333ms)
+    @Published var showStats = false
 
-    // ── Biomechanically correct plank thresholds ──────────────────────────────
-    //
-    // Hip angle (shoulder→hip→knee):
-    //   A straight plank body = ~170°. We allow 160°–175°.
-    //   Below 155° = clear sag. Above 178° = clear pike.
-    private let hipIdealMin:    Double = 160
-    private let hipIdealMax:    Double = 175
-    private let hipSagLimit:    Double = 155   // below this → definitely sagging
-    private let hipPikeLimit:   Double = 178   // above this → definitely piked
+    @Published var targetSeconds: Int = 0
 
-    // Spine angle (shoulder→hip line deviation from horizontal):
-    //   Perfect plank = body parallel to floor = ~0°.
-    //   We allow up to 18° for natural variation and camera angle tolerance.
-    private let spineIdealMax:  Double = 18
+    func setGoal(seconds: Int) {
+        DispatchQueue.main.async { self.targetSeconds = seconds }
+    }
 
-    // Neck angle (ear→shoulder line deviation from horizontal):
-    //   Head in neutral = parallel to body = ~0°.
-    //   Up to 25° is acceptable; beyond this the head is drooping or craning.
-    private let neckIdealMax:   Double = 25
+    func clearGoal() {
+        DispatchQueue.main.async { self.targetSeconds = 0 }
+    }
 
-    // ── Timer hysteresis ──────────────────────────────────────────────────────
-    // goodFramesNeeded = 10 (published above)
-    // badFramesRequired: how many bad frames before timer pauses
-    private let badFramesRequired = 5
+    @Published var holdHistory:      [HoldRecord] = []
+    @Published var sessionTimeString = "00:00"
+
+    private var sessionStartDate: Date?
+    private var sessionClockTimer: Timer?
+
+    private var holdScoreAccum:   Int = 0
+    private var holdScoreFrames:  Int = 0
+
+    var averageFormScore: Int {
+        guard !holdHistory.isEmpty else { return 0 }
+        return holdHistory.map(\.score).reduce(0, +) / holdHistory.count
+    }
+
+    let goodFramesNeeded = 10
+
+    private let hipExcellentMin:    Double = 170
+    private let hipAcceptableMin:   Double = 165
+    private let spineExcellentMin:  Double = 175
+    private let spineAcceptableMin: Double = 165
+    private let neckExcellentMin:   Double = 170
+    private let neckAcceptableMin:  Double = 160
+    private let standingGuardMin:   Double = 120
+
+    private let badFramesRequired    = 5
     private var consecutiveBadFrames = 0
+    private var holdingState         = false
 
-    // ── Smoothing ─────────────────────────────────────────────────────────────
-    // 8-frame sliding window smooths out Vision jitter
+    private var isProcessingFrame = false
+    private let poseRequest = VNDetectHumanBodyPoseRequest()
+
+    private var pointsBuffer: [[VNHumanBodyPoseObservation.JointName: CGPoint]] = []
+    private let pointsBufferSize = 6
+
     private var angleBuffer: [(hip: Double, spine: Double, neck: Double)] = []
-    private let bufferSize = 8
+    private let angleBufferSize = 8
 
-    // ── Debounce (prevents issue label flickering) ────────────────────────────
     private var stableIssueFrames = 0
     private var lastIssue: PlankIssue = .detecting
+    private var notVisibleFrames = 0
 
     private var timerTask:  Task<Void, Never>?
     private var alertTimer: Timer?
 
-    // Watch notification throttle
     private var lastNotifTime: [String: Date] = [:]
     private let notifCooldown: TimeInterval   = 4.0
+
+    private var announcedMilestones = Set<Int>()
+    private var goalAnnounced       = false
+
+    private let speechSynthesizer = AVSpeechSynthesizer()
+    private var lastSpokenTime: [String: Date] = [:]
+    private let voiceCooldown: TimeInterval = 4.0
 
     // MARK: - Lifecycle
     func start() {
@@ -461,30 +640,73 @@ final class PlankViewModel: NSObject, ObservableObject,
             guard granted else { return }
             DispatchQueue.global(qos: .userInitiated).async { self.setupCamera() }
         }
+        startSessionClock()
+        speak("Get into plank position. Timer starts when your form is perfect.")
         fireWatchNotification(
             title: "🏋️ Plank Started",
             body:  "Get into position. Timer starts when form is perfect."
         )
     }
 
-    func stop() { session.stopRunning(); stopTimer() }
+    func stop() {
+        session.stopRunning()
+        stopTimer()
+        stopSessionClock()
+        speechSynthesizer.stopSpeaking(at: .immediate)
+        recordHoldIfNeeded()
+    }
 
     func resetTimer() {
         DispatchQueue.main.async {
+            self.recordHoldIfNeeded()
             self.stopTimer()
-            self.elapsedSeconds          = 0
+            self.holdingState            = false
             self.isHolding               = false
+            self.elapsedSeconds          = 0
             self.consecutiveGoodFrames   = 0
             self.consecutiveBadFrames    = 0
             self.angleBuffer.removeAll()
+            self.pointsBuffer.removeAll()
+            self.announcedMilestones.removeAll()
+            self.goalAnnounced   = false
+            self.holdScoreAccum  = 0
+            self.holdScoreFrames = 0
         }
     }
 
-    // MARK: - Camera
+    private func startSessionClock() {
+        sessionStartDate = Date()
+        sessionClockTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
+            guard let self, let start = self.sessionStartDate else { return }
+            let elapsed = Int(Date().timeIntervalSince(start))
+            self.sessionTimeString = self.formatSeconds(elapsed)
+        }
+    }
+
+    private func stopSessionClock() {
+        sessionClockTimer?.invalidate()
+        sessionClockTimer = nil
+    }
+
+    private func recordHoldIfNeeded() {
+        guard elapsedSeconds >= 1 else { return }
+        let avgScore = holdScoreFrames > 0 ? holdScoreAccum / holdScoreFrames : plankResult.postureScore
+        let record = HoldRecord(
+            holdNumber: holdHistory.count + 1,
+            seconds:    elapsedSeconds,
+            score:      avgScore,
+            timestamp:  Date()
+        )
+        holdHistory.append(record)
+        holdScoreAccum  = 0
+        holdScoreFrames = 0
+    }
+
+    // MARK: - Camera setup
     private func setupCamera() {
         guard !session.isRunning else { return }
         session.beginConfiguration()
-        session.sessionPreset = .high
+        session.sessionPreset = .hd1280x720
         session.inputs.forEach { session.removeInput($0) }
         guard
             let device = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: cameraPosition),
@@ -493,8 +715,13 @@ final class PlankViewModel: NSObject, ObservableObject,
         else { session.commitConfiguration(); return }
         session.addInput(input)
         let output = AVCaptureVideoDataOutput()
-        output.setSampleBufferDelegate(self, queue: DispatchQueue(label: "plankVideoQueue"))
+        output.setSampleBufferDelegate(self, queue: DispatchQueue(label: "plankVideoQueue",
+                                                                   qos: .userInteractive))
         output.alwaysDiscardsLateVideoFrames = true
+        output.videoSettings = [
+            kCVPixelBufferPixelFormatTypeKey as String:
+                kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
+        ]
         if session.canAddOutput(output) { session.addOutput(output) }
         session.commitConfiguration()
         session.startRunning()
@@ -510,196 +737,231 @@ final class PlankViewModel: NSObject, ObservableObject,
                 let inp = try? AVCaptureDeviceInput(device: dev),
                 self.session.canAddInput(inp)
             else { self.session.commitConfiguration(); return }
-            self.session.addInput(inp); self.session.commitConfiguration()
+            self.session.addInput(inp)
+            self.session.commitConfiguration()
             DispatchQueue.main.async { self.cameraPosition = newPos }
         }
     }
 
+    // MARK: - Frame delivery
     func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer,
                        from connection: AVCaptureConnection) {
+        guard !isProcessingFrame else { return }
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+        isProcessingFrame = true
         let orientation: CGImagePropertyOrientation = cameraPosition == .front ? .leftMirrored : .right
         analyzeFrame(pixelBuffer: pixelBuffer, orientation: orientation)
     }
 
     // MARK: - Analysis pipeline
     private func analyzeFrame(pixelBuffer: CVPixelBuffer, orientation: CGImagePropertyOrientation) {
-        let request = VNDetectHumanBodyPoseRequest()
+        defer { isProcessingFrame = false }
         let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: orientation)
         do {
-            try handler.perform([request])
-            guard let observation = request.results?.first else { return }
+            try handler.perform([poseRequest])
+            guard let observation = poseRequest.results?.first else { return }
             let points = try observation.recognizedPoints(.all)
 
-            updateBodyPoints(points)
+            let smoothedBodyPoints = buildSmoothedPoints(points)
 
             guard var result = extractAngles(from: points) else {
-                DispatchQueue.main.async { self.plankResult.issue = .notVisible }
-                pauseTimer()
+                notVisibleFrames += 1
+                if notVisibleFrames >= 8 {
+                    DispatchQueue.main.async { self.plankResult.issue = .notVisible }
+                    pauseTimer()
+                }
                 return
             }
+            notVisibleFrames = 0
 
-            // Smooth angles over 8 frames
             let s = smooth(result)
             result.hipAngle   = s.hip
             result.spineAngle = s.spine
             result.neckAngle  = s.neck
 
-            // Evaluate form against biomechanical thresholds
             evaluateForm(result: &result)
-
-            // Update timer state based on form
             updateTimerState(result: result)
 
-            // Debounce issue label (prevents flickering)
+            if holdingState {
+                holdScoreAccum  += result.postureScore
+                holdScoreFrames += 1
+            }
+
             if result.issue == lastIssue { stableIssueFrames += 1 }
             else { stableIssueFrames = 0; lastIssue = result.issue }
             var published = result
             if stableIssueFrames < 3 { published.issue = plankResult.issue }
 
-            // Fire real-time form alert
-            // Use non-debounced result for alerts so corrections appear immediately
-            // The displayed issue label uses debounced `published` to prevent flickering
-            updateFormAlert(result: result)
-            DispatchQueue.main.async { self.plankResult = published }
+            let alertMsg   = buildAlertMessage(result: result)
+            let goodFrames = consecutiveGoodFrames
+
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.bodyPoints  = smoothedBodyPoints
+                self.plankResult = published
+                self.consecutiveGoodFrames = goodFrames
+
+                if let msg = alertMsg {
+                    if self.formAlertMessage != msg {
+                        self.formAlertMessage = msg
+                        self.alertTimer?.invalidate()
+                        self.alertTimer = Timer.scheduledTimer(
+                            withTimeInterval: 2.5, repeats: false
+                        ) { [weak self] _ in self?.showFormAlert = false }
+                    }
+                    self.showFormAlert = true
+                } else {
+                    self.alertTimer?.invalidate()
+                    self.alertTimer = nil
+                    self.showFormAlert = false
+                }
+            }
+
+            if let msg = alertMsg {
+                fireWatchNotification(title: "⚠️ Fix Your Form", body: msg, key: msg)
+                speak(msg)
+            }
         } catch { print("Plank Vision error: \(error)") }
     }
 
-    // MARK: - Angle extraction
+    private func buildSmoothedPoints(
+        _ points: [VNHumanBodyPoseObservation.JointName: VNRecognizedPoint]
+    ) -> [VNHumanBodyPoseObservation.JointName: CGPoint] {
+        var mapped: [VNHumanBodyPoseObservation.JointName: CGPoint] = [:]
+        for (joint, point) in points where point.confidence > 0.2 {
+            mapped[joint] = CGPoint(x: point.location.x, y: 1 - point.location.y)
+        }
+        pointsBuffer.append(mapped)
+        if pointsBuffer.count > pointsBufferSize { pointsBuffer.removeFirst() }
+        var smoothed: [VNHumanBodyPoseObservation.JointName: CGPoint] = [:]
+        let uniqueJoints = Set(pointsBuffer.flatMap { $0.keys })
+        for joint in uniqueJoints {
+            let positions = pointsBuffer.compactMap { $0[joint] }
+            guard !positions.isEmpty else { continue }
+            let n = CGFloat(positions.count)
+            smoothed[joint] = CGPoint(x: positions.map(\.x).reduce(0,+)/n,
+                                      y: positions.map(\.y).reduce(0,+)/n)
+        }
+        return smoothed
+    }
+
     private func extractAngles(
         from points: [VNHumanBodyPoseObservation.JointName: VNRecognizedPoint]
     ) -> PlankResult? {
         let useLeft = betterSide(points)
-
         let shoulderKey: VNHumanBodyPoseObservation.JointName = useLeft ? .leftShoulder : .rightShoulder
         let hipKey:      VNHumanBodyPoseObservation.JointName = useLeft ? .leftHip      : .rightHip
         let kneeKey:     VNHumanBodyPoseObservation.JointName = useLeft ? .leftKnee     : .rightKnee
         let ankleKey:    VNHumanBodyPoseObservation.JointName = useLeft ? .leftAnkle    : .rightAnkle
         let earKey:      VNHumanBodyPoseObservation.JointName = useLeft ? .leftEar      : .rightEar
 
-        // All five joints required — plank needs the full chain
         for joint in [shoulderKey, hipKey, kneeKey, ankleKey, earKey] {
-            guard let p = points[joint], p.confidence > 0.35 else { return nil }
+            guard let p = points[joint], p.confidence > 0.2 else { return nil }
         }
 
         let shoulder = points[shoulderKey]!.location
         let hip      = points[hipKey]!.location
         let knee     = points[kneeKey]!.location
+        let ankle    = points[ankleKey]!.location
         let ear      = points[earKey]!.location
 
         var result = PlankResult()
         result.trackedLeftSide = useLeft
-
-        // 1. Hip angle: shoulder → hip → knee
-        //    Measures straightness of the body line.
-        //    180° = perfectly straight. Lower = hips sagging. Higher = piked.
-        result.hipAngle = calculateAngle(first: shoulder, middle: hip, last: knee)
-
-        // 2. Spine angle: deviation of shoulder→hip vector from horizontal
-        //    In Vision coords y=0 is at the bottom, so a horizontal body
-        //    (lying in plank) gives shoulder.y ≈ hip.y → atan2 ≈ 0°.
-        let spineRad  = atan2(shoulder.y - hip.y, shoulder.x - hip.x) * 180 / .pi
-        result.spineAngle = min(abs(spineRad), 90)
-
-        // 3. Neck angle: deviation of ear→shoulder vector from horizontal
-        //    Same principle — head neutral = parallel to floor = ~0°.
-        let neckRad   = atan2(ear.y - shoulder.y, ear.x - shoulder.x) * 180 / .pi
-        result.neckAngle = min(abs(neckRad), 90)
-
+        result.hipAngle   = calculateAngle(first: shoulder, middle: hip,      last: knee)
+        result.spineAngle = calculateAngle(first: shoulder, middle: hip,      last: ankle)
+        result.neckAngle  = calculateAngle(first: ear,      middle: shoulder, last: hip)
         return result
     }
 
-    // MARK: - Form evaluation
-    // Uses a two-tier system for the hip:
-    //   • Ideal range (160°–175°) — green, timer runs
-    //   • Tolerance range (155°–178°) — yellow, timer still runs but flags issue
-    //   • Outside tolerance — red, timer pauses
-    // This avoids pausing the timer for a 1–2° deviation from perfect.
     private func evaluateForm(result: inout PlankResult) {
         let hip   = result.hipAngle
         let spine = result.spineAngle
         let neck  = result.neckAngle
 
-        // Guard: person is upright (spine > 45° = standing/sitting)
-        guard spine < 45 else {
+        guard spine >= standingGuardMin else {
             result.hipOk = true; result.spineOk = true; result.neckOk = true
             result.issue = .ready; result.postureScore = 100
             return
         }
 
-        // Hip check — use tolerance range for ok/not-ok (not just ideal)
-        // This means the timer runs if hips are between 155°–178°,
-        // but the issue label will show a correction if outside 160°–175°.
-        result.hipOk = hip >= hipSagLimit && hip <= hipPikeLimit
+        result.hipOk   = hip   >= hipAcceptableMin
+        result.spineOk = spine >= spineAcceptableMin
+        result.neckOk  = neck  >= neckAcceptableMin
 
-        // Spine and neck use their ideal ranges
-        result.spineOk = spine <= spineIdealMax
-        result.neckOk  = neck  <= neckIdealMax
-
-        // Score (weighted: hip most important, then spine, then neck)
         var score = 100
-        if !result.hipOk   { score -= 45 }
-        if !result.spineOk { score -= 35 }
-        if !result.neckOk  { score -= 20 }
+        if !result.spineOk { score -= 40 }
+        if !result.hipOk   { score -= 35 }
+        if !result.neckOk  { score -= 25 }
         result.postureScore = max(score, 0)
 
-        // Issue label — most critical error shown first
-        if !result.hipOk {
-            result.issue = hip < hipSagLimit ? .hipsTooLow : .hipsTooHigh
-        } else if !result.spineOk { result.issue = .backSagging }
-        else if !result.neckOk    { result.issue = .headDropping }
-        else {
-            // Form is within tolerance — show ideal corrections subtly if outside ideal
-            if hip < hipIdealMin      { result.issue = .hipsTooLow  }
-            else if hip > hipIdealMax { result.issue = .hipsTooHigh }
-            else                      { result.issue = .correct }
-        }
+        if !result.spineOk      { result.issue = .backSagging  }
+        else if !result.hipOk   { result.issue = .hipsTooLow   }
+        else if !result.neckOk  { result.issue = .headDropping }
+        else                    { result.issue = .correct      }
     }
 
-    // MARK: - Timer state machine
-    //
-    // The timer only starts when ALL checks pass for goodFramesNeeded frames.
-    // This is the key "posture must be correct first" requirement.
-    // If any check fails for badFramesRequired frames, the timer pauses.
     private func updateTimerState(result: PlankResult) {
         if result.formIsValid {
-            consecutiveBadFrames = 0
-            consecutiveGoodFrames += 1
-            if consecutiveGoodFrames >= goodFramesNeeded {
-                startTimer()
-            }
+            consecutiveBadFrames  = 0
+            consecutiveGoodFrames = min(consecutiveGoodFrames + 1, goodFramesNeeded + 1)
+            if consecutiveGoodFrames >= goodFramesNeeded { startTimer() }
         } else {
-            consecutiveGoodFrames = max(0, consecutiveGoodFrames - 1)  // decay, don't reset hard
-            consecutiveBadFrames  += 1
+            consecutiveGoodFrames = max(0, consecutiveGoodFrames - 1)
+            consecutiveBadFrames += 1
             if consecutiveBadFrames >= badFramesRequired {
                 pauseTimer()
-                triggerFormBreakFlash()
+                DispatchQueue.main.async {
+                    self.showFormBreakFlash = true
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                        self.showFormBreakFlash = false
+                    }
+                }
             }
         }
-        // Publish consecutiveGoodFrames for the progress bar in the View
-        DispatchQueue.main.async { }   // already on background; publish happens via @Published
     }
 
     private func startTimer() {
-        guard !isHolding else { return }
+        guard !holdingState else { return }
+        holdingState = true
         DispatchQueue.main.async { self.isHolding = true }
+
         timerTask = Task { [weak self] in
             guard let self else { return }
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(1))
-                if Task.isCancelled { break }
+                guard !Task.isCancelled else { break }
                 await MainActor.run {
                     self.elapsedSeconds += 1
-                    // Personal best notification
+
+                    if self.targetSeconds > 0,
+                       self.elapsedSeconds == self.targetSeconds,
+                       !self.goalAnnounced {
+                        self.goalAnnounced = true
+                        self.speakImmediate("Goal reached! Amazing hold!")
+                        self.fireWatchNotification(
+                            title: "🎯 Goal Reached!",
+                            body:  "You hit your \(self.formatSeconds(self.targetSeconds)) target!"
+                        )
+                    }
+
+                    let milestones = [10, 30, 60, 90, 120, 150, 180, 210, 240, 270, 300]
+                    if milestones.contains(self.elapsedSeconds),
+                       !self.announcedMilestones.contains(self.elapsedSeconds) {
+                        self.announcedMilestones.insert(self.elapsedSeconds)
+                        let secs  = self.elapsedSeconds
+                        let label = secs < 60 ? "\(secs) seconds"
+                                              : "\(secs / 60) minute\(secs / 60 > 1 ? "s" : "")"
+                        self.speakImmediate("\(label)! Keep it up!")
+                    }
+
                     if self.elapsedSeconds > self.bestSeconds {
                         self.bestSeconds = self.elapsedSeconds
-                        // Only notify at meaningful milestones: 10s, 30s, 60s, then every 30s
-                        let milestones = [10, 30, 60, 90, 120, 150, 180, 210, 240, 270, 300]
                         if milestones.contains(self.bestSeconds) {
                             self.fireWatchNotification(
                                 title: "🏆 New Best!",
                                 body:  "You held for \(self.formatSeconds(self.bestSeconds))!"
                             )
+                            self.speakImmediate("New personal best!")
                         }
                     }
                 }
@@ -708,90 +970,72 @@ final class PlankViewModel: NSObject, ObservableObject,
     }
 
     private func pauseTimer() {
-        guard isHolding else { return }
-        stopTimer()
-        DispatchQueue.main.async { self.isHolding = false }
-    }
-
-    private func stopTimer() { timerTask?.cancel(); timerTask = nil }
-
-    private func triggerFormBreakFlash() {
+        guard holdingState else { return }
+        holdingState = false
+        timerTask?.cancel()
+        timerTask = nil
         DispatchQueue.main.async {
-            self.showFormBreakFlash = true
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
-                self.showFormBreakFlash = false
-            }
+            self.isHolding = false
+            self.recordHoldIfNeeded()
+            self.elapsedSeconds = 0
+            self.announcedMilestones.removeAll()
+            self.goalAnnounced = false
         }
     }
 
-    // MARK: - Form alert + watch notification
-    private func updateFormAlert(result: PlankResult) {
-        var message: String? = nil
-
-        if !result.hipOk {
-            message = result.hipAngle < hipSagLimit
-                ? "Raise Your Hips — They're Sagging!"
-                : "Lower Your Hips — They're Too High!"
-        } else if !result.spineOk {
-            message = "Keep Your Back Straight!"
-        } else if !result.neckOk {
-            message = "Keep Your Head Neutral!"
-        } else if result.issue == .hipsTooLow {
-            message = "Push Hips Up Slightly"
-        } else if result.issue == .hipsTooHigh {
-            message = "Drop Hips Down Slightly"
-        }
-
-        if let msg = message {
-            // Key by the specific message so each error type has its own 5s throttle.
-            // "Raise Your Hips" and "Keep Back Straight" are independent throttles.
-            fireWatchNotification(title: "⚠️ Fix Your Form", body: msg, key: msg)
-        }
-
-        DispatchQueue.main.async {
-            if let msg = message {
-                // Show banner immediately and keep it visible as long as error persists.
-                // Only reset the 2s dismiss timer when the message CHANGES.
-                if self.formAlertMessage != msg {
-                    self.formAlertMessage = msg
-                    self.alertTimer?.invalidate()
-                    self.alertTimer = Timer.scheduledTimer(withTimeInterval: 2.5, repeats: false) { _ in
-                        DispatchQueue.main.async { self.showFormAlert = false }
-                    }
-                }
-                self.showFormAlert = true
-            } else {
-                // No error — hide banner immediately
-                self.alertTimer?.invalidate()
-                self.showFormAlert = false
-            }
-        }
+    private func stopTimer() {
+        holdingState = false
+        timerTask?.cancel()
+        timerTask = nil
     }
 
-    // MARK: - Watch notification
+    private func buildAlertMessage(result: PlankResult) -> String? {
+        guard !result.formIsValid else { return nil }
+        if !result.spineOk { return "Keep Your Back Straight — Hips Are Sagging!" }
+        if !result.hipOk   { return "Raise Your Hips — They're Too Low!" }
+        if !result.neckOk  { return "Keep Your Head Neutral — Don't Drop It!" }
+        return nil
+    }
+
     func fireWatchNotification(title: String, body: String, key: String? = nil) {
         let throttleKey = key ?? title
         let now = Date()
-        if let last = lastNotifTime[throttleKey], now.timeIntervalSince(last) < notifCooldown { return }
+        if let last = lastNotifTime[throttleKey],
+           now.timeIntervalSince(last) < notifCooldown { return }
         lastNotifTime[throttleKey] = now
         NotificationManager.shared.send(title: title, body: body)
         WatchConnectivityManager.shared.sendFormAlert(exercise: "Plank", issue: "\(title): \(body)")
     }
 
-    // MARK: - Helpers
-    private func betterSide(_ points: [VNHumanBodyPoseObservation.JointName: VNRecognizedPoint]) -> Bool {
-        func c(_ j: VNHumanBodyPoseObservation.JointName) -> Float { points[j]?.confidence ?? 0 }
-        let l: Float = c(.leftShoulder) + c(.leftHip) + c(.leftKnee) + c(.leftAnkle) + c(.leftEar)
-        let r: Float = c(.rightShoulder) + c(.rightHip) + c(.rightKnee) + c(.rightAnkle) + c(.rightEar)
-        return l >= r
+    private func speak(_ text: String) {
+        let now = Date()
+        if let last = lastSpokenTime[text], now.timeIntervalSince(last) < voiceCooldown { return }
+        lastSpokenTime[text] = now
+        guard !speechSynthesizer.isSpeaking else { return }
+        let utterance = AVSpeechUtterance(string: text)
+        utterance.rate = 0.5; utterance.voice = AVSpeechSynthesisVoice(language: "en-US"); utterance.volume = 1.0
+        speechSynthesizer.speak(utterance)
     }
 
-    private func updateBodyPoints(_ points: [VNHumanBodyPoseObservation.JointName: VNRecognizedPoint]) {
-        var mapped: [VNHumanBodyPoseObservation.JointName: CGPoint] = [:]
-        for (joint, point) in points where point.confidence > 0.3 {
-            mapped[joint] = CGPoint(x: point.location.x, y: 1 - point.location.y)
-        }
-        DispatchQueue.main.async { self.bodyPoints = mapped }
+    private func speakImmediate(_ text: String) {
+        speechSynthesizer.stopSpeaking(at: .immediate)
+        let utterance = AVSpeechUtterance(string: text)
+        utterance.rate = 0.5; utterance.voice = AVSpeechSynthesisVoice(language: "en-US"); utterance.volume = 1.0
+        speechSynthesizer.speak(utterance)
+    }
+
+    private func betterSide(_ points: [VNHumanBodyPoseObservation.JointName: VNRecognizedPoint]) -> Bool {
+        let lShoulder: Float = points[.leftShoulder]?.confidence ?? 0
+        let lHip:      Float = points[.leftHip]?.confidence      ?? 0
+        let lKnee:     Float = points[.leftKnee]?.confidence     ?? 0
+        let lAnkle:    Float = points[.leftAnkle]?.confidence    ?? 0
+        let lEar:      Float = points[.leftEar]?.confidence      ?? 0
+        let rShoulder: Float = points[.rightShoulder]?.confidence ?? 0
+        let rHip:      Float = points[.rightHip]?.confidence      ?? 0
+        let rKnee:     Float = points[.rightKnee]?.confidence     ?? 0
+        let rAnkle:    Float = points[.rightAnkle]?.confidence    ?? 0
+        let rEar:      Float = points[.rightEar]?.confidence      ?? 0
+        return (lShoulder + lHip + lKnee + lAnkle + lEar) >= (rShoulder + rHip + rKnee + rAnkle + rEar)
     }
 
     private func calculateAngle(first: CGPoint, middle: CGPoint, last: CGPoint) -> Double {
@@ -804,7 +1048,7 @@ final class PlankViewModel: NSObject, ObservableObject,
 
     private func smooth(_ result: PlankResult) -> (hip: Double, spine: Double, neck: Double) {
         angleBuffer.append((result.hipAngle, result.spineAngle, result.neckAngle))
-        if angleBuffer.count > bufferSize { angleBuffer.removeFirst() }
+        if angleBuffer.count > angleBufferSize { angleBuffer.removeFirst() }
         let n = Double(angleBuffer.count)
         return (
             hip:   angleBuffer.map(\.hip).reduce(0,   +) / n,

@@ -47,39 +47,10 @@ struct HomeView: View {
                                              subtitle: "Hold timer · hip, back & neck",
                                              color: .green, tip: "Side-on camera")
                             }
-                            NavigationLink(destination: SidePlankCameraView()) {
-                                ExerciseCard(icon: "figure.pilates",
-                                             title: "Side Plank",
-                                             subtitle: "Hold timer · body line, torso, arm & neck",
-                                             color: .purple, tip: "Side-on camera")
-                            }
-                            NavigationLink(destination: DeadBugCameraView()) {
-                                ExerciseCard(icon: "figure.roll",
-                                             title: "Dead Bug",
-                                             subtitle: "Rep counter · back, arm, leg & knee",
-                                             color: .red, tip: "Side-on camera")
-                            }
-                            NavigationLink(destination: BirdDogCameraView()) {
-                                ExerciseCard(icon: "figure.cooldown",
-                                             title: "Bird-Dog",
-                                             subtitle: "Rep counter · back, arm, leg & hip",
-                                             color: .teal, tip: "Side-on camera")
-                            }
-                            NavigationLink(destination: MountainClimberCameraView()) {
-                                ExerciseCard(icon: "figure.hiking",
-                                             title: "Mountain Climber",
-                                             subtitle: "Rep counter · plank back & knee drive",
-                                             color: .mint, tip: "Side-on camera")
-                            }
+
 
                             // ── Lower Body ────────────────────────────────────
                             sectionHeader("Lower Body")
-                            NavigationLink(destination: LungeCameraView()) {
-                                ExerciseCard(icon: "figure.walk",
-                                             title: "Lunges",
-                                             subtitle: "Rep counter · front knee, back knee & torso",
-                                             color: .orange, tip: "Face camera front-on")
-                            }
                             NavigationLink(destination: GluteBridgeCameraView()) {
                                 ExerciseCard(icon: "figure.gymnastics",
                                              title: "Glute Bridge",
@@ -87,20 +58,6 @@ struct HomeView: View {
                                              color: .pink, tip: "Side-on camera")
                             }
 
-                            // ── Cardio ────────────────────────────────────────
-                            sectionHeader("Cardio")
-                            NavigationLink(destination: BurpeeCameraView()) {
-                                ExerciseCard(icon: "figure.jumprope",
-                                             title: "Burpee",
-                                             subtitle: "Rep counter · plank, jump & back",
-                                             color: .indigo, tip: "Side-on camera")
-                            }
-                            NavigationLink(destination: JumpingJackCameraView()) {
-                                ExerciseCard(icon: "figure.mixed.cardio",
-                                             title: "Jumping Jack",
-                                             subtitle: "Rep counter · arm raise, leg spread & symmetry",
-                                             color: .cyan, tip: "Face camera front-on")
-                            }
                         }
                         .padding(.horizontal, 20).padding(.bottom, 30)
                     }

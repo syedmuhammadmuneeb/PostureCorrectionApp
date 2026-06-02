@@ -2,37 +2,61 @@
 //  PushUpView.swift
 //  PostureCorrect
 //
-//  Camera placement: SIDE-ON — phone level with the user's chest/shoulder,
-//  ~1.5–2 m away. Full body (wrist → elbow → shoulder → hip → knee) visible.
+//  Camera placement: SIDE-ON — phone on the floor to your left or right,
+//  ~1.5–2 m away, lens at shoulder/hip height. Full body must be visible.
 //
 //  ─────────────────────────────────────────────────────────────────────────
-//  PUSH-UP ANGLES  (biomechanically correct)
+//  BIOMECHANICALLY CORRECT PUSH-UP ANGLES  (Vision side-on, floor camera)
 //  ─────────────────────────────────────────────────────────────────────────
 //
-//  1. Elbow angle (shoulder → elbow → wrist)
-//     Start (high plank): ~160°–180° (arms nearly straight)
-//     Bottom (chest near floor): 70°–110° — the key depth check
-//     < 70°  = elbows flared / going too deep
-//     > 110° = not going low enough
+//  1. Elbow angle  (shoulder → elbow → wrist)
+//     • Top (arms extended):        150°–180°
+//     • Bottom excellent:            80°–100°
+//     • Bottom acceptable:           70°–110°
+//     • Depth threshold:            ≤ 72°   (4 consecutive frames — based on observed ~58° bottom)
+//     • Excellent depth:              ≤ 65°
+//     • Minimum descent to record a rep event: ≤ 100°
+//     • Descent trigger: < 145°
 //
-//  2. Hip angle (shoulder → hip → knee)
-//     Should stay ~155°–180° throughout — body in a straight line.
-//     < 155° = hips sagging toward the floor
-//     > 180° = hips piked up
+//  2. Hip angle  (shoulder → hip → knee)
+//     • Excellent:   170°–180°
+//     • Acceptable:  155°–170°  (was 165° — too strict for side-on camera)
+//     • Poor:        < 155°
+//     • Sagging fail: < 145°
 //
-//  3. Spine angle (deviation of shoulder→hip line from horizontal)
-//     Body parallel to floor = ~0°. Should stay ≤ 20°.
-//     > 20°  = back arching or hips rotating
+//  3. Plank alignment score  (0–100, higher = straighter body)
+//     • Perfect plank:   100  (hip exactly on shoulder–ankle line)
+//     • Good form:       ≥ 85 (standing, bottom, ascending)
+//     • Descending:      ≥ 80 (slight shift allowed)
+//     • Visible sag/pike: < 80
+//     • Extreme:          0   (hip ≥30% of body length off the line)
+//     • spineSagging = true → hip below line (sagging); false → piking
+//
+//  4. Neck angle  (ear → shoulder → hip)
+//     • Excellent:   170°–180°
+//     • Acceptable:  160°–170°
+//     • Poor:        < 160°
 //
 //  ─────────────────────────────────────────────────────────────────────────
-//  REP STATE MACHINE (three-gate)
+//  REP COUNTING — STRICT FORM-GATED STATE MACHINE
 //  ─────────────────────────────────────────────────────────────────────────
-//  Gate 1: elbowAngle < descentTrigger (155°) → rep starts
-//  Gate 2: elbowAngle ≤ bottomMax (110°) for 3 frames → bottom confirmed
-//  Gate 3: elbowAngle ≥ topMin (150°) for 3 frames → evaluate & count
 //
-//  Form errors (spine, hip, elbow) are latched with decay counters.
-//  A rep only counts if ALL three error latches are clear at Gate 3.
+//  A rep is counted ONLY when ALL of the following are satisfied:
+//    1. Elbow reached ≤ 110° for ≥ 3 consecutive smoothed frames (depth)
+//    2. Arms returned to ≥ 150° for ≥ 2 consecutive smoothed frames (top)
+//    3. Zero hip form errors (hipAngle < 165°) for ≥ 3 frames during the rep
+//    4. Zero spine form errors (spineAngle > 35°) for ≥ 3 frames during the rep
+//    5. Zero neck form errors (neckAngle < 155°) for ≥ 3 frames during the rep
+//       (neck is advisory only when ear joint confidence < 0.15 — skipped)
+//
+//  Anti-jitter:
+//    • 8-frame angle smoother on all rep-counting angles
+//    • 6-frame overlay buffer keeps skeleton locked to body
+//    • validDepthFrames uses += only; never hard-resets mid-rep
+//    • minElbowAngle anchors the true bottom
+//    • validStandingFrames resets immediately when elbow drops below elbowUpMin
+//    • notVisibleFrames: 8 frames before surfacing "not visible"
+//    • stableIssueFrames: 3 frames before changing the issue label
 //
 
 import SwiftUI
@@ -41,46 +65,43 @@ import Vision
 import Combine
 import AVKit
 
-// MARK: - PUSH-UP ISSUE
-enum PushupIssue: String {
-    case correct      = "✅ Perfect Push-up"
-    case ready        = "🧍 Ready Position"
-    case notLowEnough = "❌ Go Lower"
-    case backSagging  = "❌ Keep Back Straight"
-    case hipsTooHigh  = "❌ Lower Your Hips"
-    case detecting    = "🔍 Detecting..."
-    case notVisible   = "📷 Full Body Not Visible"
+// MARK: - PUSHUP ISSUE
+enum PushUpIssue: String {
+    case correct       = "✅ Perfect Push-Up"
+    case ready         = "🧍 Get Into Push-Up Position"
+    case hipsTooLow    = "❌ Raise Your Hips"
+    case hipsTooHigh   = "❌ Lower Your Hips"
+    case backSagging   = "❌ Keep Body Straight"
+    case neckBad       = "❌ Keep Head Neutral"
+    case notDeepEnough = "❌ Go Lower"
+    case detecting     = "🔍 Detecting..."
+    case notVisible    = "📷 Full Body Not Visible"
+    case improperDepth = "⚠️ Go Deeper Next Time"
 }
 
-// MARK: - PUSH-UP PHASE
-enum PushupPhase { case high, descending, bottom, ascending }
+// MARK: - PUSHUP PHASE
+enum PushUpPhase { case standing, descending, bottom, ascending }
 
-// MARK: - REP RECORD
-struct PushupRepRecord: Identifiable {
-    let id        = UUID()
-    let repNumber: Int
-    let score:     Int
-    let isGood:    Bool
-    let timestamp: Date
-}
-
-// MARK: - PUSH-UP RESULT
-struct PushupResult {
-    var issue: PushupIssue = .detecting
-    var postureScore: Int  = 100
-    var elbowAngle: Double = 180
-    var hipAngle:   Double = 180
-    var spineAngle: Double = 0
+// MARK: - PUSHUP RESULT
+struct PushUpResult {
+    var issue: PushUpIssue  = .detecting
+    var postureScore: Int   = 100
+    var elbowAngle:  Double = 180
+    var hipAngle:    Double = 180
+    var spineAngle:  Double = 0         // plank alignment score 0–100
+    var spineSagging: Bool  = false     // true = hip below plank line (sag); false = piking
+    var neckAngle:   Double = 175       // ear → shoulder → hip
+    var neckTracked: Bool   = false     // false when ear joint not visible
     var trackedLeftSide: Bool = true
-    var elbowOk = true
-    var hipOk   = true
-    var spineOk = true
-    var formIsValid: Bool { elbowOk && hipOk && spineOk }
+    var elbowOk:  Bool = true
+    var hipOk:    Bool = true
+    var spineOk:  Bool = true
+    var neckOk:   Bool = true
 }
 
-// MARK: - CAMERA VIEW
+// MARK: - CAMERA VIEW  (compact GluteBridge-style UI)
 struct PushupCameraView: View {
-    @StateObject private var viewModel = PushupViewModel()
+    @StateObject private var viewModel = PushUpViewModel()
     @State private var showGoalSheet   = false
     @State private var showStatsSheet  = false
 
@@ -88,7 +109,7 @@ struct PushupCameraView: View {
         ZStack {
             CameraPreview(session: viewModel.session).ignoresSafeArea()
 
-            PushupSkeletonOverlay(
+            PushUpSkeletonOverlay(
                 bodyPoints: viewModel.bodyPoints,
                 result:     viewModel.postureResult
             ).ignoresSafeArea()
@@ -97,7 +118,7 @@ struct PushupCameraView: View {
                 topBar
                 Spacer()
                 if viewModel.showFormAlert {
-                    PushupAlertBanner(message: viewModel.formAlertMessage)
+                    PushUpFormAlertBanner(message: viewModel.formAlertMessage)
                         .transition(.move(edge: .top).combined(with: .opacity))
                         .animation(.spring(response: 0.4), value: viewModel.showFormAlert)
                 }
@@ -105,119 +126,163 @@ struct PushupCameraView: View {
                 bottomPanel
             }
 
-            // Bad rep flash
-            if viewModel.showBadRepFlash {
+            // Good rep flash
+            if viewModel.showGoodRepFlash {
+                Color.green.opacity(0.22).ignoresSafeArea().allowsHitTesting(false)
+            }
+
+            // Bad rep flash overlay — matches GluteBridge style
+            if viewModel.badRepMessage != nil {
                 Color.red.opacity(0.25).ignoresSafeArea().allowsHitTesting(false)
                 VStack {
                     Spacer()
-                    Text("⚠️ Rep Not Counted\n\(viewModel.badRepReason)")
+                    Text(viewModel.badRepMessage ?? "")
                         .font(.title3.bold()).foregroundColor(.white)
                         .multilineTextAlignment(.center).padding()
                         .background(Color.red.opacity(0.85)).cornerRadius(16)
                         .padding(.bottom, 220)
                 }
             }
-
-            // Good rep green flash
-            if viewModel.showGoodRepFlash {
-                Color.green.opacity(0.2).ignoresSafeArea().allowsHitTesting(false)
-            }
         }
         .onAppear    { viewModel.start() }
         .onDisappear { viewModel.stop()  }
-        .sheet(isPresented: $showGoalSheet)  { PushupGoalSheet(viewModel: viewModel) }
-        .sheet(isPresented: $showStatsSheet) { PushupStatsSheet(viewModel: viewModel) }
+        .sheet(isPresented: $showGoalSheet)  { PushUpGoalSheet(viewModel: viewModel) }
+        .sheet(isPresented: $showStatsSheet) { PushUpStatsSheet(viewModel: viewModel) }
     }
 
-    // MARK: - Top bar
+    // MARK: - Top bar (minimal floating pill — matches GluteBridge)
     private var topBar: some View {
-        HStack(spacing: 10) {
-            VStack(alignment: .leading, spacing: 2) {
-                Text("Push-up AI").font(.title2.bold()).foregroundColor(.white)
-                Text(viewModel.sessionTimeString)
-                    .font(.caption.monospacedDigit()).foregroundColor(.green)
-            }
+        HStack(spacing: 8) {
+            // Session timer pill
+            Text(viewModel.sessionTimeString)
+                .font(.caption.monospacedDigit().bold())
+                .foregroundColor(.white)
+                .padding(.horizontal, 10).padding(.vertical, 6)
+                .background(.black.opacity(0.5)).cornerRadius(20)
+
             Spacer()
-            Button { showStatsSheet = true } label: {
-                Image(systemName: "chart.bar.fill").font(.title2).foregroundColor(.white)
-                    .padding(10).background(Color.white.opacity(0.2)).clipShape(Circle())
-            }
-            Button { showGoalSheet = true } label: {
-                Image(systemName: "target").font(.title2).foregroundColor(.white)
-                    .padding(10).background(Color.white.opacity(0.2)).clipShape(Circle())
-            }
-            Button { viewModel.switchCamera() } label: {
-                Image(systemName: "camera.rotate").font(.title2).foregroundColor(.white)
-                    .padding(10).background(Color.white.opacity(0.2)).clipShape(Circle())
-            }
+
+            // Score ring (40 px, compact)
             ZStack {
-                Circle().stroke(Color.white.opacity(0.2), lineWidth: 5).frame(width: 58, height: 58)
+                Circle().stroke(Color.white.opacity(0.15), lineWidth: 3).frame(width: 40, height: 40)
                 Circle()
                     .trim(from: 0, to: CGFloat(viewModel.postureResult.postureScore) / 100)
-                    .stroke(scoreColor, style: StrokeStyle(lineWidth: 5, lineCap: .round))
-                    .frame(width: 58, height: 58).rotationEffect(.degrees(-90))
-                Text("\(viewModel.postureResult.postureScore)").font(.headline.bold()).foregroundColor(.white)
+                    .stroke(scoreColor, style: StrokeStyle(lineWidth: 3, lineCap: .round))
+                    .frame(width: 40, height: 40).rotationEffect(.degrees(-90))
+                Text("\(viewModel.postureResult.postureScore)")
+                    .font(.system(size: 11, weight: .bold)).foregroundColor(.white)
             }
+
+            // Action buttons — single frosted pill
+            HStack(spacing: 4) {
+                Button { showStatsSheet = true } label: {
+                    Image(systemName: "chart.bar.fill").font(.subheadline).foregroundColor(.white)
+                        .padding(8).background(Color.white.opacity(0.15)).clipShape(Circle())
+                }
+                Button { showGoalSheet = true } label: {
+                    Image(systemName: "target").font(.subheadline).foregroundColor(.white)
+                        .padding(8).background(Color.white.opacity(0.15)).clipShape(Circle())
+                }
+                Button { viewModel.switchCamera() } label: {
+                    Image(systemName: "camera.rotate").font(.subheadline).foregroundColor(.white)
+                        .padding(8).background(Color.white.opacity(0.15)).clipShape(Circle())
+                }
+            }
+            .padding(.horizontal, 6).padding(.vertical, 4)
+            .background(.black.opacity(0.5)).cornerRadius(24)
         }
-        .padding().background(.black.opacity(0.65)).cornerRadius(20).padding()
+        .padding(.horizontal, 16).padding(.top, 8)
     }
 
-    // MARK: - Bottom panel
+    // MARK: - Bottom panel (compact — matches GluteBridge layout exactly)
     private var bottomPanel: some View {
-        VStack(spacing: 14) {
-            Text(viewModel.badRepMessage ?? viewModel.postureResult.issue.rawValue)
-                .font(.title2.bold())
-                .foregroundColor(viewModel.badRepMessage != nil ? .orange : .white)
-                .multilineTextAlignment(.center)
-                .animation(.easeInOut(duration: 0.2), value: viewModel.badRepMessage)
+        VStack(spacing: 10) {
 
-            HStack(spacing: 10) {
-                PushupAngleCard(title: "Elbow", angle: viewModel.postureResult.elbowAngle,
-                                isOk: viewModel.postureResult.elbowOk, idealRange: "70°-110°")
-                PushupAngleCard(title: "Hip",   angle: viewModel.postureResult.hipAngle,
-                                isOk: viewModel.postureResult.hipOk,   idealRange: "155°-180°")
-                PushupAngleCard(title: "Back",  angle: viewModel.postureResult.spineAngle,
-                                isOk: viewModel.postureResult.spineOk, idealRange: "0°-20°")
+            // Issue label + phase pill on same row
+            HStack {
+                Text(viewModel.postureResult.issue.rawValue)
+                    .font(.subheadline.bold()).foregroundColor(.white)
+                    .lineLimit(1).minimumScaleFactor(0.8)
+                Spacer()
+                Text(viewModel.phaseText)
+                    .font(.caption.bold())
+                    .foregroundColor(viewModel.phaseColor)
+                    .padding(.horizontal, 10).padding(.vertical, 4)
+                    .background(viewModel.phaseColor.opacity(0.15))
+                    .cornerRadius(12)
             }
 
+            // Angle chips — compact single row
+            HStack(spacing: 6) {
+                PushUpAngleChip(label: "Elbow", angle: viewModel.postureResult.elbowAngle, isOk: viewModel.postureResult.elbowOk)
+                PushUpAngleChip(label: "Hip",   angle: viewModel.postureResult.hipAngle,   isOk: viewModel.postureResult.hipOk)
+                PushUpAngleChip(label: "Back",  angle: viewModel.postureResult.spineAngle, isOk: viewModel.postureResult.spineOk, unit: "")
+                if viewModel.postureResult.neckTracked {
+                    PushUpAngleChip(label: "Neck", angle: viewModel.postureResult.neckAngle, isOk: viewModel.postureResult.neckOk)
+                }
+            }
+
+            // Progress bar (only when goal is set)
             if viewModel.targetReps > 0 {
-                PushupProgressBarView(
-                    currentSet:  viewModel.currentSet,
-                    totalSets:   viewModel.targetSets,
-                    repsInSet:   viewModel.repsInCurrentSet,
-                    targetReps:  viewModel.targetReps
+                PushUpProgressBar(
+                    currentSet: viewModel.currentSet,
+                    totalSets:  viewModel.targetSets,
+                    repsInSet:  viewModel.repsInCurrentSet,
+                    targetReps: viewModel.targetReps
                 )
             }
 
-            HStack(spacing: 36) {
-                VStack(spacing: 2) {
+            // Rep count row
+            HStack(alignment: .center, spacing: 0) {
+                // Rep number — dominant
+                VStack(spacing: 0) {
                     Text("\(viewModel.repsInCurrentSet)")
-                        .font(.system(size: 48, weight: .bold)).foregroundColor(.white)
+                        .font(.system(size: 52, weight: .heavy, design: .rounded))
+                        .foregroundColor(.white)
                     Text(viewModel.targetReps > 0
-                         ? "SET \(viewModel.currentSet)/\(viewModel.targetSets)"
+                         ? "SET \(viewModel.currentSet) OF \(viewModel.targetSets)"
                          : "REPS")
-                        .font(.caption).foregroundColor(.white.opacity(0.7))
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundColor(.white.opacity(0.5))
+                        .kerning(1.2)
                 }
-                VStack(spacing: 2) {
-                    Text(viewModel.phaseText).font(.title3.bold()).foregroundColor(viewModel.phaseColor)
-                    Text("PHASE").font(.caption).foregroundColor(.white.opacity(0.7))
-                }
-                VStack(spacing: 2) {
+                .frame(maxWidth: .infinity)
+
+                // Divider
+                Rectangle().fill(Color.white.opacity(0.1)).frame(width: 1, height: 44)
+
+                // Quality
+                VStack(spacing: 4) {
                     HStack(spacing: 6) {
-                        Text("✅\(viewModel.goodReps)").foregroundColor(.green).bold()
-                        Text("❌\(viewModel.badReps)").foregroundColor(.red).bold()
-                    }.font(.subheadline)
-                    Text("QUALITY").font(.caption).foregroundColor(.white.opacity(0.7))
+                        Label("\(viewModel.goodReps)", systemImage: "checkmark.circle.fill")
+                            .foregroundColor(.green)
+                        Label("\(viewModel.badReps)", systemImage: "xmark.circle.fill")
+                            .foregroundColor(.red)
+                    }
+                    .font(.subheadline.bold())
+                    Text("QUALITY").font(.system(size: 10)).foregroundColor(.white.opacity(0.5)).kerning(1.2)
                 }
+                .frame(maxWidth: .infinity)
+
+                Rectangle().fill(Color.white.opacity(0.1)).frame(width: 1, height: 44)
+
+                // Reset
                 Button { viewModel.resetSession() } label: {
-                    VStack(spacing: 2) {
-                        Image(systemName: "arrow.counterclockwise").font(.title2).foregroundColor(.white)
-                        Text("RESET").font(.caption).foregroundColor(.white.opacity(0.7))
+                    VStack(spacing: 4) {
+                        Image(systemName: "arrow.counterclockwise")
+                            .font(.title3).foregroundColor(.white.opacity(0.7))
+                        Text("RESET").font(.system(size: 10)).foregroundColor(.white.opacity(0.4)).kerning(1.2)
                     }
                 }
+                .frame(maxWidth: .infinity)
             }
+            .padding(.top, 2)
         }
-        .padding().background(.black.opacity(0.75)).cornerRadius(22).padding()
+        .padding(.horizontal, 18).padding(.vertical, 14)
+        .background(.ultraThinMaterial.opacity(0.95))
+        .background(Color.black.opacity(0.6))
+        .cornerRadius(24)
+        .padding(.horizontal, 12).padding(.bottom, 8)
     }
 
     private var scoreColor: Color {
@@ -228,31 +293,8 @@ struct PushupCameraView: View {
     }
 }
 
-// MARK: - SUPPORTING VIEWS
-
-struct PushupProgressBarView: View {
-    let currentSet: Int; let totalSets: Int; let repsInSet: Int; let targetReps: Int
-    var body: some View {
-        VStack(spacing: 4) {
-            HStack {
-                Text("Set \(currentSet) of \(totalSets)").font(.caption).foregroundColor(.white.opacity(0.7))
-                Spacer()
-                Text("\(repsInSet)/\(targetReps) reps").font(.caption.bold()).foregroundColor(.white)
-            }
-            GeometryReader { geo in
-                ZStack(alignment: .leading) {
-                    RoundedRectangle(cornerRadius: 6).fill(Color.white.opacity(0.15)).frame(height: 10)
-                    RoundedRectangle(cornerRadius: 6).fill(Color.blue)
-                        .frame(width: geo.size.width * CGFloat(min(repsInSet, targetReps)) / CGFloat(max(targetReps, 1)),
-                               height: 10)
-                        .animation(.spring(response: 0.3), value: repsInSet)
-                }
-            }.frame(height: 10)
-        }.padding(.horizontal, 4)
-    }
-}
-
-struct PushupAlertBanner: View {
+// MARK: - FORM ALERT BANNER
+struct PushUpFormAlertBanner: View {
     let message: String
     var body: some View {
         HStack(spacing: 10) {
@@ -266,25 +308,149 @@ struct PushupAlertBanner: View {
     }
 }
 
-struct PushupAngleCard: View {
-    let title: String; let angle: Double; let isOk: Bool; let idealRange: String
+// MARK: - ANGLE CHIP  (replaces PushUpAngleCard — matches GluteBridgeAngleChip)
+struct PushUpAngleChip: View {
+    let label: String
+    let angle: Double
+    let isOk:  Bool
+    var unit:  String = "°"
+
     var body: some View {
-        VStack(spacing: 4) {
-            Text(title).font(.caption).foregroundColor(.white.opacity(0.7))
-            Text("\(Int(angle))°").font(.headline.bold()).foregroundColor(isOk ? .green : .red)
-            Text(idealRange).font(.caption2).foregroundColor(.white.opacity(0.5))
+        HStack(spacing: 4) {
+            Circle().fill(isOk ? Color.green : Color.red).frame(width: 6, height: 6)
+            Text(label).font(.system(size: 10, weight: .medium)).foregroundColor(.white.opacity(0.6))
+            Text("\(Int(angle))\(unit)").font(.system(size: 12, weight: .bold)).foregroundColor(isOk ? .green : .red)
         }
-        .frame(maxWidth: .infinity).padding(.vertical, 8)
-        .background(isOk ? Color.green.opacity(0.15) : Color.red.opacity(0.15))
-        .cornerRadius(12)
+        .padding(.horizontal, 8).padding(.vertical, 5)
+        .background(isOk ? Color.green.opacity(0.1) : Color.red.opacity(0.1))
+        .cornerRadius(10)
     }
 }
 
-struct PushupGoalSheet: View {
-    @ObservedObject var viewModel: PushupViewModel
+// MARK: - PROGRESS BAR
+struct PushUpProgressBar: View {
+    let currentSet: Int; let totalSets: Int; let repsInSet: Int; let targetReps: Int
+    var body: some View {
+        VStack(spacing: 4) {
+            HStack {
+                Text("Set \(currentSet) of \(totalSets)")
+                    .font(.caption).foregroundColor(.white.opacity(0.7))
+                Spacer()
+                Text("\(repsInSet)/\(targetReps) reps")
+                    .font(.caption.bold()).foregroundColor(.white)
+            }
+            GeometryReader { geo in
+                ZStack(alignment: .leading) {
+                    RoundedRectangle(cornerRadius: 6)
+                        .fill(Color.white.opacity(0.15)).frame(height: 10)
+                    RoundedRectangle(cornerRadius: 6).fill(Color.blue)
+                        .frame(
+                            width: geo.size.width * CGFloat(min(repsInSet, targetReps)) / CGFloat(max(targetReps, 1)),
+                            height: 10
+                        )
+                        .animation(.spring(response: 0.3), value: repsInSet)
+                }
+            }.frame(height: 10)
+        }.padding(.horizontal, 4)
+    }
+}
+
+// MARK: - SKELETON OVERLAY
+// Draws the full side-on chain:
+//   arm:  shoulder → elbow → wrist
+//   body: shoulder → hip → knee → ankle
+//   neck: ear → shoulder (when ear is visible)
+// Each segment coloured green/red by its specific form check.
+// Body points are smoothed over 6 frames so they stay locked on the body.
+struct PushUpSkeletonOverlay: View {
+    let bodyPoints: [VNHumanBodyPoseObservation.JointName: CGPoint]
+    let result: PushUpResult
+
+    var body: some View {
+        GeometryReader { geo in
+            ZStack {
+                let shoulder: VNHumanBodyPoseObservation.JointName = result.trackedLeftSide ? .leftShoulder : .rightShoulder
+                let elbow:    VNHumanBodyPoseObservation.JointName = result.trackedLeftSide ? .leftElbow    : .rightElbow
+                let wrist:    VNHumanBodyPoseObservation.JointName = result.trackedLeftSide ? .leftWrist    : .rightWrist
+                let hip:      VNHumanBodyPoseObservation.JointName = result.trackedLeftSide ? .leftHip      : .rightHip
+                let knee:     VNHumanBodyPoseObservation.JointName = result.trackedLeftSide ? .leftKnee     : .rightKnee
+                let ankle:    VNHumanBodyPoseObservation.JointName = result.trackedLeftSide ? .leftAnkle    : .rightAnkle
+                let ear:      VNHumanBodyPoseObservation.JointName = result.trackedLeftSide ? .leftEar      : .rightEar
+
+                // Arm
+                drawLine(shoulder, elbow, geo, ok: result.elbowOk)
+                drawLine(elbow,    wrist, geo, ok: result.elbowOk)
+                // Body
+                drawLine(shoulder, hip,   geo, ok: result.spineOk)
+                drawLine(hip,      knee,  geo, ok: result.hipOk)
+                drawLine(knee,     ankle, geo, ok: result.hipOk)
+                // Neck (only when ear visible)
+                if result.neckTracked {
+                    drawLine(ear, shoulder, geo, ok: result.neckOk)
+                }
+
+                let joints: [VNHumanBodyPoseObservation.JointName] = result.neckTracked
+                    ? [shoulder, elbow, wrist, hip, knee, ankle, ear]
+                    : [shoulder, elbow, wrist, hip, knee, ankle]
+
+                ForEach(joints, id: \.self) { joint in
+                    if let pt = bodyPoints[joint] {
+                        Circle()
+                            .fill(dotColor(for: joint,
+                                          shoulder: shoulder, elbow: elbow, wrist: wrist,
+                                          hip: hip, knee: knee, ankle: ankle, ear: ear))
+                            .frame(width: 14, height: 14)
+                            .overlay(Circle().stroke(Color.white.opacity(0.5), lineWidth: 1.5))
+                            .position(x: pt.x * geo.size.width, y: pt.y * geo.size.height)
+                    }
+                }
+            }
+        }
+    }
+
+    private func dotColor(
+        for joint: VNHumanBodyPoseObservation.JointName,
+        shoulder: VNHumanBodyPoseObservation.JointName,
+        elbow:    VNHumanBodyPoseObservation.JointName,
+        wrist:    VNHumanBodyPoseObservation.JointName,
+        hip:      VNHumanBodyPoseObservation.JointName,
+        knee:     VNHumanBodyPoseObservation.JointName,
+        ankle:    VNHumanBodyPoseObservation.JointName,
+        ear:      VNHumanBodyPoseObservation.JointName
+    ) -> Color {
+        switch joint {
+        case elbow, wrist:   return result.elbowOk ? .green : .red
+        case shoulder:       return (result.spineOk && result.neckOk) ? .green : .red
+        case hip:            return result.hipOk   ? .green : .red
+        case knee, ankle:    return result.hipOk   ? .green : .red
+        case ear:            return result.neckOk  ? .green : .red
+        default:             return .white
+        }
+    }
+
+    @ViewBuilder
+    private func drawLine(
+        _ j1: VNHumanBodyPoseObservation.JointName,
+        _ j2: VNHumanBodyPoseObservation.JointName,
+        _ geo: GeometryProxy,
+        ok: Bool
+    ) -> some View {
+        if let p1 = bodyPoints[j1], let p2 = bodyPoints[j2] {
+            Path { path in
+                path.move(to:    CGPoint(x: p1.x * geo.size.width, y: p1.y * geo.size.height))
+                path.addLine(to: CGPoint(x: p2.x * geo.size.width, y: p2.y * geo.size.height))
+            }
+            .stroke(ok ? Color.green : Color.red, style: StrokeStyle(lineWidth: 5, lineCap: .round))
+        }
+    }
+}
+
+// MARK: - GOAL SHEET
+struct PushUpGoalSheet: View {
+    @ObservedObject var viewModel: PushUpViewModel
     @Environment(\.dismiss) var dismiss
-    @State private var sets = 3
-    @State private var reps = 10
+    @State private var sets    = 3
+    @State private var reps    = 10
     @State private var restSec = 60
 
     var body: some View {
@@ -299,20 +465,22 @@ struct PushupGoalSheet: View {
                 }
                 Section {
                     Button("Start Workout") {
-                        viewModel.setGoal(sets: sets, reps: reps, restSeconds: restSec)
-                        dismiss()
-                    }.foregroundColor(.green).bold()
+                        viewModel.setGoal(sets: sets, reps: reps, restSeconds: restSec); dismiss()
+                    }.foregroundColor(.blue).bold()
                     Button("Clear Goal") { viewModel.clearGoal(); dismiss() }.foregroundColor(.red)
                 }
             }
             .navigationTitle("Set Goal")
-            .toolbar { ToolbarItem(placement: .navigationBarTrailing) { Button("Done") { dismiss() } } }
+            .toolbar {
+                ToolbarItem(placement: .navigationBarTrailing) { Button("Done") { dismiss() } }
+            }
         }
     }
 }
 
-struct PushupStatsSheet: View {
-    @ObservedObject var viewModel: PushupViewModel
+// MARK: - STATS SHEET
+struct PushUpStatsSheet: View {
+    @ObservedObject var viewModel: PushUpViewModel
     @Environment(\.dismiss) var dismiss
 
     var body: some View {
@@ -320,30 +488,25 @@ struct PushupStatsSheet: View {
             ScrollView {
                 VStack(spacing: 20) {
                     HStack(spacing: 12) {
-                        PushupStatCard(title: "Total Reps", value: "\(viewModel.totalRepsAllTime)", color: .blue)
-                        PushupStatCard(title: "Good Reps",  value: "\(viewModel.goodReps)",         color: .green)
-                        PushupStatCard(title: "Bad Reps",   value: "\(viewModel.badReps)",          color: .red)
+                        PushUpStatCard(title: "Total Reps", value: "\(viewModel.totalRepsAllTime)", color: .blue)
+                        PushUpStatCard(title: "Good Reps",  value: "\(viewModel.goodReps)",         color: .green)
+                        PushUpStatCard(title: "Bad Reps",   value: "\(viewModel.badReps)",          color: .red)
                     }
                     HStack(spacing: 12) {
-                        PushupStatCard(title: "Avg Score",    value: "\(viewModel.averageScore)",  color: .yellow)
-                        PushupStatCard(title: "Best Score",   value: "\(viewModel.bestRepScore)",  color: .orange)
-                        PushupStatCard(title: "Session Time", value: viewModel.sessionTimeString, color: .cyan)
+                        PushUpStatCard(title: "Avg Score",    value: "\(viewModel.averageScore)",   color: .yellow)
+                        PushUpStatCard(title: "Best Score",   value: "\(viewModel.bestRepScore)",   color: .orange)
+                        PushUpStatCard(title: "Session Time", value: viewModel.sessionTimeString,   color: .cyan)
                     }
 
                     if !viewModel.repHistory.isEmpty {
-                        VStack(alignment: .leading, spacing: 8) {
-                            Text("Rep Score History").font(.headline).padding(.horizontal)
-                            PushupRepScoreGraph(records: viewModel.repHistory).frame(height: 180).padding(.horizontal)
-                        }
-                        .padding(.vertical, 10).background(Color(.systemGray6)).cornerRadius(16).padding(.horizontal)
-
                         VStack(alignment: .leading, spacing: 6) {
                             Text("Rep History").font(.headline).padding(.horizontal)
                             ForEach(viewModel.repHistory.reversed()) { rep in
                                 HStack {
                                     Text("Rep \(rep.repNumber)").font(.subheadline)
                                     Spacer()
-                                    Text("Score: \(rep.score)").font(.subheadline.bold())
+                                    Text("Score: \(rep.score)")
+                                        .font(.subheadline.bold())
                                         .foregroundColor(rep.isGood ? .green : .red)
                                     Text(rep.isGood ? "✅" : "❌")
                                 }
@@ -353,17 +516,20 @@ struct PushupStatsSheet: View {
                         }
                     } else {
                         Text("No reps recorded yet.\nStart pushing! 💪")
-                            .multilineTextAlignment(.center).foregroundColor(.secondary).padding(.top, 40)
+                            .multilineTextAlignment(.center)
+                            .foregroundColor(.secondary).padding(.top, 40)
                     }
                 }.padding(.vertical)
             }
             .navigationTitle("Session Stats")
-            .toolbar { ToolbarItem(placement: .navigationBarTrailing) { Button("Done") { dismiss() } } }
+            .toolbar {
+                ToolbarItem(placement: .navigationBarTrailing) { Button("Done") { dismiss() } }
+            }
         }
     }
 }
 
-struct PushupStatCard: View {
+struct PushUpStatCard: View {
     let title: String; let value: String; let color: Color
     var body: some View {
         VStack(spacing: 4) {
@@ -375,127 +541,37 @@ struct PushupStatCard: View {
     }
 }
 
-struct PushupRepScoreGraph: View {
-    let records: [PushupRepRecord]
-    var body: some View {
-        GeometryReader { geo in
-            let w = geo.size.width; let h = geo.size.height
-            let barW = max(8, min(28, w / CGFloat(records.count) - 4))
-            ZStack(alignment: .bottom) {
-                ForEach([0, 25, 50, 75, 100], id: \.self) { val in
-                    let y = h * (1 - CGFloat(val) / 100)
-                    Path { p in p.move(to: CGPoint(x: 0, y: y)); p.addLine(to: CGPoint(x: w, y: y)) }
-                        .stroke(Color.gray.opacity(0.2), lineWidth: 1)
-                }
-                HStack(alignment: .bottom, spacing: 4) {
-                    ForEach(records) { rep in
-                        VStack(spacing: 2) {
-                            Text("\(rep.score)").font(.system(size: 8)).foregroundColor(.white.opacity(0.7))
-                            RoundedRectangle(cornerRadius: 4)
-                                .fill(rep.isGood ? Color.green : Color.red)
-                                .frame(width: barW, height: max(4, h * CGFloat(rep.score) / 100 - 16))
-                        }
-                    }
-                }.frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
-            }
-        }
-    }
-}
-
-// MARK: - SKELETON OVERLAY
-struct PushupSkeletonOverlay: View {
-    let bodyPoints: [VNHumanBodyPoseObservation.JointName: CGPoint]
-    let result: PushupResult
-
-    var body: some View {
-        GeometryReader { geo in
-            ZStack {
-                let s: VNHumanBodyPoseObservation.JointName = result.trackedLeftSide ? .leftShoulder : .rightShoulder
-                let e: VNHumanBodyPoseObservation.JointName = result.trackedLeftSide ? .leftElbow    : .rightElbow
-                let w: VNHumanBodyPoseObservation.JointName = result.trackedLeftSide ? .leftWrist    : .rightWrist
-                let h: VNHumanBodyPoseObservation.JointName = result.trackedLeftSide ? .leftHip      : .rightHip
-                let k: VNHumanBodyPoseObservation.JointName = result.trackedLeftSide ? .leftKnee     : .rightKnee
-
-                drawLine(s, e, geo, ok: result.elbowOk)
-                drawLine(e, w, geo, ok: result.elbowOk)
-                drawLine(s, h, geo, ok: result.spineOk)
-                drawLine(h, k, geo, ok: result.hipOk)
-
-                ForEach([s, e, w, h, k], id: \.self) { joint in
-                    if let pt = bodyPoints[joint] {
-                        Circle().fill(dotColor(for: joint)).frame(width: 14, height: 14)
-                            .overlay(Circle().stroke(Color.white.opacity(0.5), lineWidth: 1.5))
-                            .position(x: pt.x * geo.size.width, y: pt.y * geo.size.height)
-                    }
-                }
-            }
-        }
-    }
-
-    private func dotColor(for joint: VNHumanBodyPoseObservation.JointName) -> Color {
-        switch joint {
-        case .leftShoulder, .rightShoulder: return result.spineOk ? .green : .red
-        case .leftElbow,    .rightElbow:    return result.elbowOk ? .green : .red
-        case .leftWrist,    .rightWrist:    return result.elbowOk ? .green : .red
-        case .leftHip,      .rightHip:      return result.hipOk   ? .green : .red
-        case .leftKnee,     .rightKnee:     return result.hipOk   ? .green : .red
-        default:                            return .white
-        }
-    }
-
-    @ViewBuilder
-    private func drawLine(_ j1: VNHumanBodyPoseObservation.JointName,
-                          _ j2: VNHumanBodyPoseObservation.JointName,
-                          _ geo: GeometryProxy, ok: Bool) -> some View {
-        if let p1 = bodyPoints[j1], let p2 = bodyPoints[j2] {
-            Path { path in
-                path.move(to: CGPoint(x: p1.x * geo.size.width, y: p1.y * geo.size.height))
-                path.addLine(to: CGPoint(x: p2.x * geo.size.width, y: p2.y * geo.size.height))
-            }
-            .stroke(ok ? Color.green : Color.red, style: StrokeStyle(lineWidth: 5, lineCap: .round))
-        }
-    }
-}
-
 // MARK: - VIEW MODEL
-final class PushupViewModel: NSObject, ObservableObject,
+final class PushUpViewModel: NSObject, ObservableObject,
                               AVCaptureVideoDataOutputSampleBufferDelegate {
 
     let session = AVCaptureSession()
 
-    @Published var bodyPoints:    [VNHumanBodyPoseObservation.JointName: CGPoint] = [:]
-    @Published var postureResult  = PushupResult()
-    @Published var currentPhase:  PushupPhase = .high
-    @Published var phaseText      = "High Position"
+    @Published var bodyPoints:     [VNHumanBodyPoseObservation.JointName: CGPoint] = [:]
+    @Published var postureResult   = PushUpResult()
+    @Published var currentPhase: PushUpPhase = .standing
+    @Published var phaseText       = "Up"
     @Published var phaseColor: Color = .white
     @Published var cameraPosition: AVCaptureDevice.Position = .back
 
-    @Published var showFormAlert    = false
-    @Published var formAlertMessage = ""
-    @Published var showBadRepFlash  = false
-    @Published var badRepReason     = ""
-    @Published var showGoodRepFlash = false
+    @Published var showFormAlert     = false
+    @Published var formAlertMessage  = ""
+    @Published var showGoodRepFlash  = false
     @Published var badRepMessage: String? = nil
 
     // Analytics
-    @Published var repHistory:       [PushupRepRecord] = []
-    @Published var goodReps          = 0
-    @Published var badReps           = 0
-    @Published var totalRepsAllTime  = 0
-    @Published var averageScore      = 0
-    @Published var bestRepScore      = 0
+    @Published var repHistory:      [RepRecord] = []
+    @Published var goodReps         = 0
+    @Published var badReps          = 0
+    @Published var totalRepsAllTime = 0
+    @Published var averageScore     = 0
+    @Published var bestRepScore     = 0
 
     // Sets / Goal
-    @Published var targetSets       = 0
-    @Published var targetReps       = 0
-    @Published var currentSet       = 1
-    @Published var repsInCurrentSet = 0
-
-    // Rest timer
-    @Published var isResting        = false
-    @Published var restSecondsLeft  = 0
-    private var restDuration        = 60
-    private var restTimer: Timer?
+    @Published var targetSets        = 0
+    @Published var targetReps        = 0
+    @Published var currentSet        = 1
+    @Published var repsInCurrentSet  = 0
 
     // Session timer
     @Published var sessionTimeString = "00:00"
@@ -504,45 +580,68 @@ final class PushupViewModel: NSObject, ObservableObject,
 
     @Published var reps = 0
 
-    // ── Thresholds ────────────────────────────────────────────────────────────
-    private let elbowDescentTrigger: Double = 155  // arm starts bending past this
-    private let elbowBottomMax:      Double = 110  // must reach this depth
-    private let elbowBottomIdealMin: Double = 70   // ideal bottom range
-    private let elbowBottomIdealMax: Double = 110
-    private let elbowTopMin:         Double = 150  // must return to this to close rep
-    private let hipAngleMin:         Double = 155  // body straight lower bound
-    private let hipAngleMax:         Double = 185  // body straight upper bound
-    private let spineAngleMax:       Double = 20   // max torso tilt from horizontal
+    // ── Smoothing buffers ────────────────────────────────────────────────────
+    // 6-frame overlay buffer → skeleton stays locked to body at all times
+    private var pointsBuffer: [[VNHumanBodyPoseObservation.JointName: CGPoint]] = []
+    // 8-frame angle buffer → stable angle readings for all rep logic
+    private var frameBuffer:  [PushUpResult] = []
 
-    // ── Smoothing ─────────────────────────────────────────────────────────────
-    private var angleBuffer: [(elbow: Double, hip: Double, spine: Double)] = []
-    private let bufferSize = 6
+    // ── Rep-counting state ───────────────────────────────────────────────────
+    private var lastElbowAngle      = 180.0
+    private var minElbowAngle       = 180.0   // true minimum seen this rep
+    private var pushUpStarted       = false
+    private var depthReached        = false
+    private var bottomReached       = false
+    private var validDepthFrames    = 0       // counts up only; never hard-reset mid-rep
+    private var validBottomFrames   = 0
+    private var validStandingFrames = 0
 
-    // ── Rep state (three-gate) ────────────────────────────────────────────────
-    private var repInProgress  = false
-    private var bottomReached  = false
-    private var minElbowSeen   = 180.0
-    private var framesAtBottom = 0
-    private var framesAtTop    = 0
-
-    // Error accumulators — decay on clean frames so single noisy frames don't latch
-    private var spineErrFrames = 0; private var hadSpineError = false
-    private var hipErrFrames   = 0; private var hadHipError   = false
-    private var elbowErrFrames = 0; private var hadElbowError = false
-
-    // ── Debounce ──────────────────────────────────────────────────────────────
-    private var stableIssueFrames = 0
-    private var lastIssue: PushupIssue = .detecting
+    // ── Debounce / noise ─────────────────────────────────────────────────────
+    private var stableIssueFrames  = 0
+    private var notVisibleFrames   = 0
+    private var lastIssue: PushUpIssue = .detecting
     private var alertTimer: Timer?
 
-    // Speech
-    private let speechSynth     = AVSpeechSynthesizer()
-    private var lastSpokenIssue: PushupIssue = .detecting
-    private var lastSpeechTime:  Date = .distantPast
+    // ── Per-rep form error accumulators ─────────────────────────────────────
+    // Each counter decays by 1 per frame when form is good (never hard-resets),
+    // so a single clean frame cannot erase accumulated errors.
+    private var hipErrorFrames    = 0
+    private var spineErrorFrames  = 0
+    private var neckErrorFrames   = 0
+    private var hadHipError       = false
+    private var hadSpineError     = false
+    private var hadNeckError      = false
 
-    // Watch notification throttle
+    // ── Watch / notification throttle ───────────────────────────────────────
     private var lastNotifTime: [String: Date] = [:]
-    private let notifCooldown: TimeInterval   = 4.0
+    private let notifCooldown: TimeInterval   = 5.0
+
+    private let speechSynth      = AVSpeechSynthesizer()
+    private var lastSpeechTime:  Date = .distantPast
+    private var lastSpokenIssue: PushUpIssue = .detecting
+
+    // ════════════════════════════════════════════════════════════════════════
+    // THRESHOLDS
+    // ════════════════════════════════════════════════════════════════════════
+
+    private let elbowDescentTrigger: Double = 145
+    private let elbowMinimumDescent: Double = 100
+    private let elbowDepthMax:       Double = 72
+    private let elbowDepthExcellent: Double = 65
+    private let elbowUpMin:          Double = 150
+
+    private let hipExcellentMin:  Double = 170
+    private let hipAcceptableMin: Double = 155
+    private let hipSaggingFail:   Double = 145
+
+    private let spineIdealMax: Double = 35
+    private let uprightGuard:  Double = 60
+
+    private let neckAcceptableMin: Double = 160
+    private let neckErrorMin:      Double = 155
+
+    private let depthFramesRequired:    Int = 4
+    private let standingFramesRequired: Int = 2
 
     // MARK: - Lifecycle
     func start() {
@@ -551,24 +650,33 @@ final class PushupViewModel: NSObject, ObservableObject,
             DispatchQueue.global(qos: .userInitiated).async { self.setupCamera() }
         }
         startSessionTimer()
-        fireWatchNotification(title: "💪 Push-up Started",
-                              body: "Get into high plank position.")
+        fireWatchNotification(title: "🏋️ Push-Up Started", body: "Get into position and begin.")
     }
 
     func stop() {
         session.stopRunning()
         sessionTimer?.invalidate()
-        restTimer?.invalidate()
     }
 
-    private func startSessionTimer() {
-        sessionStartDate = Date()
-        sessionTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
-            guard let self, let start = self.sessionStartDate else { return }
-            let e = Int(Date().timeIntervalSince(start))
-            DispatchQueue.main.async {
-                self.sessionTimeString = String(format: "%02d:%02d", e / 60, e % 60)
-            }
+    func resetSession() {
+        DispatchQueue.main.async {
+            self.reps = 0; self.repsInCurrentSet = 0; self.currentSet = 1
+            self.goodReps = 0; self.badReps = 0; self.totalRepsAllTime = 0
+            self.averageScore = 0; self.bestRepScore = 0; self.repHistory = []
+            self.currentPhase = .standing; self.phaseText = "Up"; self.phaseColor = .white
+        }
+        resetPushUpState()
+    }
+
+    private func resetPushUpState() {
+        pushUpStarted = false; depthReached = false; bottomReached = false
+        validDepthFrames = 0; validBottomFrames = 0; validStandingFrames = 0
+        lastElbowAngle = 180; minElbowAngle = 180
+        hipErrorFrames = 0; spineErrorFrames = 0; neckErrorFrames = 0
+        hadHipError = false; hadSpineError = false; hadNeckError = false
+        frameBuffer = []; pointsBuffer = []
+        DispatchQueue.main.async {
+            self.currentPhase = .standing; self.phaseText = "Up"; self.phaseColor = .white
         }
     }
 
@@ -576,7 +684,6 @@ final class PushupViewModel: NSObject, ObservableObject,
     func setGoal(sets: Int, reps: Int, restSeconds: Int) {
         DispatchQueue.main.async {
             self.targetSets = sets; self.targetReps = reps
-            self.restDuration = restSeconds
             self.currentSet = 1; self.repsInCurrentSet = 0
         }
     }
@@ -588,26 +695,23 @@ final class PushupViewModel: NSObject, ObservableObject,
         }
     }
 
-    // MARK: - Reset
-    func resetSession() {
-        DispatchQueue.main.async {
-            self.reps = 0; self.repsInCurrentSet = 0; self.currentSet = 1
-            self.goodReps = 0; self.badReps = 0; self.totalRepsAllTime = 0
-            self.averageScore = 0; self.bestRepScore = 0; self.repHistory = []
-            self.repInProgress = false; self.bottomReached = false; self.minElbowSeen = 180
-            self.framesAtBottom = 0; self.framesAtTop = 0
-            self.spineErrFrames = 0; self.hipErrFrames = 0; self.elbowErrFrames = 0
-            self.hadSpineError = false; self.hadHipError = false; self.hadElbowError = false
-            self.currentPhase = .high; self.phaseText = "High Position"; self.phaseColor = .white
-            self.isResting = false; self.restTimer?.invalidate()
-            self.sessionStartDate = Date()
+    // MARK: - Session timer
+    private func startSessionTimer() {
+        sessionStartDate = Date()
+        sessionTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
+            guard let self, let start = self.sessionStartDate else { return }
+            let e = Int(Date().timeIntervalSince(start))
+            DispatchQueue.main.async {
+                self.sessionTimeString = String(format: "%02d:%02d", e / 60, e % 60)
+            }
         }
     }
 
-    // MARK: - Camera
+    // MARK: - Camera setup
     private func setupCamera() {
         guard !session.isRunning else { return }
-        session.beginConfiguration(); session.sessionPreset = .high
+        session.beginConfiguration()
+        session.sessionPreset = .high
         session.inputs.forEach { session.removeInput($0) }
         guard
             let device = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: cameraPosition),
@@ -619,7 +723,8 @@ final class PushupViewModel: NSObject, ObservableObject,
         output.setSampleBufferDelegate(self, queue: DispatchQueue(label: "pushupVideoQueue"))
         output.alwaysDiscardsLateVideoFrames = true
         if session.canAddOutput(output) { session.addOutput(output) }
-        session.commitConfiguration(); session.startRunning()
+        session.commitConfiguration()
+        session.startRunning()
     }
 
     func switchCamera() {
@@ -644,194 +749,263 @@ final class PushupViewModel: NSObject, ObservableObject,
         analyzeFrame(pixelBuffer: pixelBuffer, orientation: orientation)
     }
 
-    // MARK: - Analysis pipeline
+    // MARK: - Analyze frame
     private func analyzeFrame(pixelBuffer: CVPixelBuffer, orientation: CGImagePropertyOrientation) {
-        guard !isResting else { return }
         let request = VNDetectHumanBodyPoseRequest()
         let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: orientation)
         do {
             try handler.perform([request])
-            guard let obs = request.results?.first else { return }
-            let pts = try obs.recognizedPoints(.all)
-            updateBodyPoints(pts)
-            guard var result = extractAngles(from: pts) else {
-                DispatchQueue.main.async { self.postureResult.issue = .notVisible }; return
+            guard let observation = request.results?.first else { return }
+            let points = try observation.recognizedPoints(.all)
+
+            updateBodyPoints(points)
+
+            let rawResult = analyzePushUpPosture(points)
+
+            if rawResult.issue == .notVisible {
+                notVisibleFrames += 1
+                if notVisibleFrames >= 8 {
+                    DispatchQueue.main.async { self.postureResult = rawResult }
+                }
+                return
+            } else {
+                notVisibleFrames = 0
             }
-            let s = smooth(result)
-            result.elbowAngle = s.elbow; result.hipAngle = s.hip; result.spineAngle = s.spine
-            evaluateForm(result: &result)
-            updatePhaseAndReps(result: result)
 
-            if result.issue == lastIssue { stableIssueFrames += 1 }
-            else { stableIssueFrames = 0; lastIssue = result.issue }
-            var published = result
-            if stableIssueFrames < 3 { published.issue = postureResult.issue }
+            var smoothed = smoothResult(rawResult)
+            updatePhaseAndReps(smoothedResult: smoothed)
 
-            // Form alert uses raw result (not debounced) for immediate feedback
-            updateFormAlert(result: result)
-            speakFormCue(result: result)
-            DispatchQueue.main.async { self.postureResult = published }
-        } catch { print("Pushup Vision error: \(error)") }
+            if smoothed.issue == lastIssue { stableIssueFrames += 1 }
+            else { stableIssueFrames = 0; lastIssue = smoothed.issue }
+            if stableIssueFrames < 3 { smoothed.issue = postureResult.issue }
+
+            updateFormAlert(result: smoothed)
+            DispatchQueue.main.async { self.postureResult = smoothed }
+        } catch {
+            print("PushUp Vision error: \(error)")
+        }
     }
 
-    // MARK: - Angle extraction
-    private func extractAngles(from pts: [VNHumanBodyPoseObservation.JointName: VNRecognizedPoint])
-        -> PushupResult? {
-        let lSh: Float = pts[.leftShoulder]?.confidence ?? 0
-        let lEl: Float = pts[.leftElbow]?.confidence    ?? 0
-        let lWr: Float = pts[.leftWrist]?.confidence    ?? 0
-        let lHp: Float = pts[.leftHip]?.confidence      ?? 0
-        let lKn: Float = pts[.leftKnee]?.confidence     ?? 0
-        let rSh: Float = pts[.rightShoulder]?.confidence ?? 0
-        let rEl: Float = pts[.rightElbow]?.confidence    ?? 0
-        let rWr: Float = pts[.rightWrist]?.confidence    ?? 0
-        let rHp: Float = pts[.rightHip]?.confidence      ?? 0
-        let rKn: Float = pts[.rightKnee]?.confidence     ?? 0
-        let lC = lSh + lEl + lWr + lHp + lKn
-        let rC = rSh + rEl + rWr + rHp + rKn
-        let useLeft = lC >= rC
+    // MARK: - Posture analysis
+    private func analyzePushUpPosture(
+        _ points: [VNHumanBodyPoseObservation.JointName: VNRecognizedPoint]
+    ) -> PushUpResult {
+        var result = PushUpResult()
+        let useLeft = betterSide(points)
+        result.trackedLeftSide = useLeft
 
-        let sK: VNHumanBodyPoseObservation.JointName = useLeft ? .leftShoulder : .rightShoulder
-        let eK: VNHumanBodyPoseObservation.JointName = useLeft ? .leftElbow    : .rightElbow
-        let wK: VNHumanBodyPoseObservation.JointName = useLeft ? .leftWrist    : .rightWrist
-        let hK: VNHumanBodyPoseObservation.JointName = useLeft ? .leftHip      : .rightHip
-        let kK: VNHumanBodyPoseObservation.JointName = useLeft ? .leftKnee     : .rightKnee
+        let shoulderKey: VNHumanBodyPoseObservation.JointName = useLeft ? .leftShoulder : .rightShoulder
+        let elbowKey:    VNHumanBodyPoseObservation.JointName = useLeft ? .leftElbow    : .rightElbow
+        let wristKey:    VNHumanBodyPoseObservation.JointName = useLeft ? .leftWrist    : .rightWrist
+        let hipKey:      VNHumanBodyPoseObservation.JointName = useLeft ? .leftHip      : .rightHip
+        let kneeKey:     VNHumanBodyPoseObservation.JointName = useLeft ? .leftKnee     : .rightKnee
+        let ankleKey:    VNHumanBodyPoseObservation.JointName = useLeft ? .leftAnkle    : .rightAnkle
+        let earKey:      VNHumanBodyPoseObservation.JointName = useLeft ? .leftEar      : .rightEar
 
-        for j in [sK, eK, wK, hK, kK] {
-            guard let p = pts[j], p.confidence > 0.4 else { return nil }
+        let conf: Float = 0.15
+        for joint in [shoulderKey, elbowKey, wristKey, hipKey, kneeKey] {
+            guard let p = points[joint], p.confidence > conf else {
+                result.issue = .notVisible; return result
+            }
         }
 
-        let sh = pts[sK]!.location; let el = pts[eK]!.location
-        let wr = pts[wK]!.location; let hp = pts[hK]!.location; let kn = pts[kK]!.location
+        let shoulder = points[shoulderKey]!.location
+        let elbow    = points[elbowKey]!.location
+        let wrist    = points[wristKey]!.location
+        let hip      = points[hipKey]!.location
+        let knee     = points[kneeKey]!.location
 
-        var result = PushupResult(); result.trackedLeftSide = useLeft
-        result.elbowAngle = calculateAngle(first: sh, middle: el, last: wr)
-        result.hipAngle   = calculateAngle(first: sh, middle: hp, last: kn)
-        let raw           = atan2(sh.y - hp.y, sh.x - hp.x) * 180 / .pi
-        result.spineAngle = min(abs(raw), 90)
+        result.elbowAngle = calculateAngle(first: shoulder, middle: elbow, last: wrist)
+        result.hipAngle   = calculateAngle(first: shoulder, middle: hip,   last: knee)
+
+        let ankleConf = points[ankleKey]?.confidence ?? 0
+        let anklePoint: CGPoint = ankleConf > 0.1
+            ? points[ankleKey]!.location
+            : CGPoint(x: knee.x + (knee.x - hip.x) * 0.6,
+                      y: knee.y + (knee.y - hip.y) * 0.6)
+
+        let refDX = anklePoint.x - shoulder.x
+        let refDY = anklePoint.y - shoulder.y
+        let refLen = sqrt(refDX * refDX + refDY * refDY)
+        let crossZ   = refDX * (hip.y - shoulder.y) - refDY * (hip.x - shoulder.x)
+        let perpDist = refLen > 0.001 ? Double(crossZ) / Double(refLen) : 0.0
+        let clampedDev = max(-0.3, min(0.3, perpDist))
+        let alignScore = 100.0 - (abs(clampedDev) / 0.3) * 100.0
+
+        result.spineAngle   = alignScore
+        result.spineSagging = perpDist < 0
+
+        if let earPoint = points[earKey], earPoint.confidence > 0.15 {
+            result.neckAngle   = calculateAngle(first: earPoint.location, middle: shoulder, last: hip)
+            result.neckTracked = true
+            result.neckOk      = result.neckAngle >= neckAcceptableMin
+        } else {
+            result.neckTracked = false
+            result.neckOk      = true
+        }
+
+        let personIsUpright = result.elbowAngle >= 165 && result.hipAngle >= 165
+        guard !personIsUpright else {
+            result.elbowOk = true; result.hipOk = true; result.spineOk = true; result.neckOk = true
+            result.issue = .ready; result.postureScore = 100
+            return result
+        }
+
+        let spineThresh: Double = (currentPhase == .descending) ? 80.0 : 85.0
+        result.spineOk = result.spineAngle >= spineThresh
+        result.hipOk   = result.hipAngle >= hipAcceptableMin
+
+        switch currentPhase {
+        case .standing, .ascending:
+            result.elbowOk = result.elbowAngle >= elbowUpMin
+        case .descending:
+            result.elbowOk = result.elbowAngle < elbowDescentTrigger
+        case .bottom:
+            result.elbowOk = result.elbowAngle <= elbowDepthMax
+        }
+
+        var score = 100
+        if result.hipAngle < hipSaggingFail       { score -= 40 }
+        else if result.hipAngle < hipAcceptableMin { score -= 25 }
+        else if result.hipAngle < hipExcellentMin  { score -= 10 }
+        if !result.spineOk { score -= 30 }
+        if !result.elbowOk { score -= 20 }
+        if result.neckTracked && !result.neckOk { score -= 15 }
+        if currentPhase == .bottom || currentPhase == .descending {
+            if result.elbowAngle <= elbowDepthExcellent   { score = min(100, score + 5) }
+            else if result.elbowAngle > elbowDepthMax      { score -= 10 }
+        }
+        result.postureScore = max(score, 0)
+
+        if !result.hipOk {
+            result.issue = .hipsTooLow
+        } else if !result.spineOk {
+            result.issue = result.spineSagging ? .hipsTooLow : .backSagging
+        } else if result.neckTracked && !result.neckOk {
+            result.issue = .neckBad
+        } else {
+            result.issue = .correct
+        }
+
         return result
     }
 
-    // MARK: - Form evaluation
-    private func evaluateForm(result: inout PushupResult) {
-        // If arms straight → person is in high plank / ready position
-        guard result.elbowAngle < elbowDescentTrigger else {
-            result.elbowOk = true; result.hipOk = true; result.spineOk = true
-            result.issue = .ready; result.postureScore = 100; return
-        }
+    // MARK: - Phase & rep counting state machine
+    private func updatePhaseAndReps(smoothedResult: PushUpResult) {
+        let elbowAngle = smoothedResult.elbowAngle
+        let prev       = lastElbowAngle
+        var nextPhase  = currentPhase
+        var addRep     = false
 
-        // Elbow: only check depth at the bottom; mid-rep is transitional
-        let atBottom   = result.elbowAngle <= elbowBottomMax
-        result.elbowOk = atBottom
-            ? (result.elbowAngle >= elbowBottomIdealMin && result.elbowAngle <= elbowBottomIdealMax)
-            : true
-
-        // Hip and spine: checked throughout the entire rep
-        result.hipOk   = result.hipAngle   >= hipAngleMin && result.hipAngle   <= hipAngleMax
-        result.spineOk = result.spineAngle <= spineAngleMax
-
-        var score = 100
-        if !result.elbowOk { score -= 30 }
-        if !result.hipOk   { score -= 35 }
-        if !result.spineOk { score -= 35 }
-        result.postureScore = max(score, 0)
-
-        // Issue label: most critical first
-        if !result.spineOk      { result.issue = .backSagging }
-        else if !result.hipOk   { result.issue = .hipsTooHigh }
-        else if !result.elbowOk { result.issue = .notLowEnough }
-        else                    { result.issue = .correct }
-    }
-
-    // MARK: - Rep state machine
-    private func updatePhaseAndReps(result: PushupResult) {
-        let elbow = result.elbowAngle
-
-        if repInProgress {
-            if !result.spineOk { spineErrFrames += 1 } else { spineErrFrames = max(0, spineErrFrames - 1) }
-            if !result.hipOk   { hipErrFrames   += 1 } else { hipErrFrames   = max(0, hipErrFrames   - 1) }
-            if elbow <= elbowBottomMax && !result.elbowOk {
-                elbowErrFrames += 1
-            } else { elbowErrFrames = max(0, elbowErrFrames - 1) }
-            if spineErrFrames >= 3 { hadSpineError = true }
-            if hipErrFrames   >= 3 { hadHipError   = true }
-            if elbowErrFrames >= 3 { hadElbowError = true }
-            minElbowSeen = min(minElbowSeen, elbow)
-        }
-
-        var nextPhase = currentPhase; var addRep = false; var badRep = false
-
-        // Gate 1: arm starts bending
-        if !repInProgress && elbow < elbowDescentTrigger {
-            repInProgress = true; minElbowSeen = elbow
-            framesAtBottom = 0; framesAtTop = 0; nextPhase = .descending
-        }
-
-        // Gate 2: bottom reached
-        if repInProgress && elbow <= elbowBottomMax {
-            framesAtBottom += 1
-            if framesAtBottom >= 3 { bottomReached = true; nextPhase = .bottom }
-        } else if repInProgress { framesAtBottom = max(0, framesAtBottom - 1) }
-
-        // Ascending
-        if bottomReached && elbow > elbowBottomMax && elbow < elbowTopMin { nextPhase = .ascending }
-
-        // Gate 3: arms return to top
-        if repInProgress && elbow >= elbowTopMin {
-            framesAtTop += 1
-            if framesAtTop >= 3 {
-                if bottomReached {
-                    let goodForm = !hadSpineError && !hadHipError && !hadElbowError
-                    if goodForm {
-                        addRep = true
-                        triggerGoodRepFeedback(score: result.postureScore)
-                    } else { badRep = true }
-                } else { badRep = true }
-                repInProgress = false; bottomReached = false; minElbowSeen = 180
-                framesAtBottom = 0; framesAtTop = 0
-                spineErrFrames = 0; hipErrFrames = 0; elbowErrFrames = 0
-                hadSpineError = false; hadHipError = false; hadElbowError = false
-                nextPhase = .high
+        if currentPhase == .descending || currentPhase == .bottom || currentPhase == .ascending {
+            if !smoothedResult.hipOk   { hipErrorFrames += 1   } else { hipErrorFrames   = max(0, hipErrorFrames - 1)   }
+            if !smoothedResult.spineOk { spineErrorFrames += 1 } else { spineErrorFrames = max(0, spineErrorFrames - 1) }
+            if smoothedResult.neckTracked {
+                if smoothedResult.neckAngle < neckErrorMin { neckErrorFrames += 1 } else { neckErrorFrames = max(0, neckErrorFrames - 1) }
             }
-        } else { if elbow < elbowTopMin { framesAtTop = 0 } }
+            if hipErrorFrames   >= 3 { hadHipError   = true }
+            if spineErrorFrames >= 3 { hadSpineError = true }
+            if neckErrorFrames  >= 3 { hadNeckError  = true }
+        }
 
-        let scoreSnap = result.postureScore
-        let reasons   = buildBadRepReasons()
+        if elbowAngle < elbowDescentTrigger && prev > elbowAngle && !pushUpStarted {
+            nextPhase     = .descending
+            pushUpStarted = true
+        }
+
+        if elbowAngle < minElbowAngle { minElbowAngle = elbowAngle }
+
+        if elbowAngle <= elbowDepthMax {
+            validDepthFrames += 1
+            if validDepthFrames >= depthFramesRequired { depthReached = true }
+        } else if elbowAngle > (elbowDepthMax + 8) && !depthReached {
+            validDepthFrames = 0
+        }
+
+        let startedRising = depthReached && elbowAngle > (minElbowAngle + 4)
+        if startedRising && !bottomReached {
+            validBottomFrames += 1
+            if validBottomFrames >= 3 { nextPhase = .bottom; bottomReached = true }
+        } else if !depthReached {
+            validBottomFrames = 0
+        }
+
+        if bottomReached && elbowAngle > (prev + 2) && elbowAngle < elbowUpMin {
+            nextPhase = .ascending
+        }
+
+        if elbowAngle < elbowUpMin { validStandingFrames = 0 }
+
+        if pushUpStarted && elbowAngle >= elbowUpMin {
+            validStandingFrames += 1
+            if validStandingFrames >= standingFramesRequired {
+                let hadRealDescent = minElbowAngle <= elbowMinimumDescent
+                if hadRealDescent {
+                    if depthReached {
+                        let formWasGood = !hadHipError && !hadSpineError && !hadNeckError
+                        if formWasGood {
+                            addRep = true
+                            triggerGoodRepFeedback(score: smoothedResult.postureScore)
+                        } else {
+                            triggerBadRepFeedback()
+                        }
+                    } else {
+                        triggerBadRepFeedback()
+                    }
+                }
+                nextPhase = .standing
+                pushUpStarted = false; depthReached = false; bottomReached = false
+                validStandingFrames = 0; validBottomFrames = 0
+                validDepthFrames    = 0; minElbowAngle     = 180
+                hipErrorFrames  = 0; spineErrorFrames  = 0; neckErrorFrames = 0
+                hadHipError     = false; hadSpineError = false; hadNeckError  = false
+            }
+        }
+
+        lastElbowAngle = elbowAngle
+        let scoreSnapshot = smoothedResult.postureScore
 
         DispatchQueue.main.async {
             if addRep {
-                self.reps += 1
+                self.reps             += 1
                 self.repsInCurrentSet += 1
                 self.totalRepsAllTime += 1
                 self.speakRepCount(self.repsInCurrentSet)
 
                 if self.targetReps > 0 && self.repsInCurrentSet >= self.targetReps {
                     if self.currentSet < self.targetSets {
-                        self.speakText("Set \(self.currentSet) complete! Rest now.")
-                        self.startRestTimer()
-                        self.currentSet += 1; self.repsInCurrentSet = 0
+                        self.speakText("Set \(self.currentSet) complete!")
+                        self.currentSet       += 1
+                        self.repsInCurrentSet  = 0
+                        self.fireWatchNotification(
+                            title: "✅ Set Complete",
+                            body:  "Rest, then start set \(self.currentSet)."
+                        )
                     } else {
                         self.speakText("Workout complete! Great job!")
                         self.fireWatchNotification(
                             title: "🎉 Workout Complete!",
-                            body:  "You finished all \(self.targetSets) sets!"
+                            body:  "You finished all \(self.targetSets) sets."
                         )
                     }
                 }
 
-                let record = PushupRepRecord(repNumber: self.totalRepsAllTime,
-                                             score: scoreSnap, isGood: true, timestamp: Date())
+                let record = RepRecord(
+                    repNumber: self.totalRepsAllTime,
+                    score:     scoreSnapshot,
+                    isGood:    true,
+                    timestamp: Date()
+                )
                 self.repHistory.append(record)
                 self.updateScoreStats()
             }
-            if badRep { self.triggerBadRepFeedback(reasons: reasons) }
 
             self.currentPhase = nextPhase
             switch nextPhase {
-            case .high:       self.phaseText = "High Position";    self.phaseColor = .white
-            case .descending: self.phaseText = "Going Down";       self.phaseColor = .yellow
-            case .bottom:     self.phaseText = "Perfect Depth ✅"; self.phaseColor = .green
-            case .ascending:  self.phaseText = "Pushing Up";       self.phaseColor = .blue
+            case .standing:   self.phaseText = "Up";          self.phaseColor = .white
+            case .descending: self.phaseText = "Going Down";  self.phaseColor = .yellow
+            case .bottom:     self.phaseText = "Deep ✅";     self.phaseColor = .green
+            case .ascending:  self.phaseText = "Coming Up";   self.phaseColor = .blue
             }
         }
     }
@@ -845,22 +1019,6 @@ final class PushupViewModel: NSObject, ObservableObject,
         }
     }
 
-    // MARK: - Rest timer
-    private func startRestTimer() {
-        restSecondsLeft = restDuration; isResting = true
-        restTimer?.invalidate()
-        restTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] t in
-            guard let self else { t.invalidate(); return }
-            DispatchQueue.main.async {
-                self.restSecondsLeft -= 1
-                if self.restSecondsLeft <= 0 {
-                    t.invalidate(); self.isResting = false
-                    self.speakText("Go!")
-                }
-            }
-        }
-    }
-
     // MARK: - Feedback
     private func triggerGoodRepFeedback(score: Int) {
         DispatchQueue.main.async {
@@ -869,116 +1027,166 @@ final class PushupViewModel: NSObject, ObservableObject,
         }
     }
 
-    private func triggerBadRepFeedback(reasons: String) {
-        fireWatchNotification(title: "❌ Rep Not Counted", body: reasons)
+    private func triggerBadRepFeedback() {
+        var reasons: [String] = []
+        if hadSpineError { reasons.append("Keep body straight") }
+        if hadHipError   { reasons.append("Hips sagging") }
+        if hadNeckError  { reasons.append("Head dropping") }
+        if !depthReached { reasons.append("Go lower") }
+        if reasons.isEmpty { reasons.append("Check your form") }
+        let message = "⚠️ Rep Not Counted\n" + reasons.joined(separator: " • ")
+
+        if hadSpineError      { speakText("Keep your body straight") }
+        else if hadHipError   { speakText("Keep your hips up") }
+        else if hadNeckError  { speakText("Keep your head neutral") }
+        else                  { speakText("Go lower next time") }
+
+        fireWatchNotification(title: "❌ Bad Rep!", body: reasons.joined(separator: " • "))
+
         DispatchQueue.main.async {
-            self.badRepMessage = "⚠️ \(reasons)"
-            let record = PushupRepRecord(repNumber: self.totalRepsAllTime + 1,
-                                         score: 0, isGood: false, timestamp: Date())
+            self.badRepMessage = message
+            let record = RepRecord(
+                repNumber: self.totalRepsAllTime + 1,
+                score:     0,
+                isGood:    false,
+                timestamp: Date()
+            )
             self.repHistory.append(record)
             self.totalRepsAllTime += 1
+            self.badReps          += 1
             self.updateScoreStats()
             DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { self.badRepMessage = nil }
         }
     }
 
-    private func buildBadRepReasons() -> String {
-        var r: [String] = []
-        if hadSpineError  { r.append("Back not straight") }
-        if hadHipError    { r.append("Hips sagging/high") }
-        if hadElbowError  { r.append("Elbow angle off") }
-        if !bottomReached { r.append("Go lower next time") }
-        return r.isEmpty ? "Go lower next time" : r.joined(separator: " • ")
+    private func speakFormCue(result: PushUpResult) {
+        guard currentPhase == .descending || currentPhase == .bottom else { return }
+        let now = Date()
+        guard now.timeIntervalSince(lastSpeechTime) > 3.0 else { return }
+        var cue: String? = nil
+        if !result.spineOk                           { cue = "Keep your body straight" }
+        else if !result.hipOk                        { cue = "Keep your hips up" }
+        else if result.neckTracked && !result.neckOk { cue = "Keep your head neutral" }
+        else if !result.elbowOk && currentPhase == .descending { cue = "Go lower" }
+        guard let text = cue, result.issue != lastSpokenIssue else { return }
+        lastSpokenIssue = result.issue
+        lastSpeechTime  = now
+        let u = AVSpeechUtterance(string: text); u.rate = 0.5; u.volume = 0.9
+        DispatchQueue.main.async { self.speechSynth.speak(u) }
     }
 
-    // MARK: - Form alert (live corrections, same as squats)
-    private func updateFormAlert(result: PushupResult) {
+    private func updateFormAlert(result: PushUpResult) {
         guard currentPhase == .descending || currentPhase == .bottom else {
-            DispatchQueue.main.async { self.showFormAlert = false }; return
+            DispatchQueue.main.async { self.showFormAlert = false }
+            return
         }
         var message: String? = nil
-        if !result.spineOk    { message = "Keep Your Back Straight!" }
-        else if !result.hipOk { message = "Keep Hips Level!" }
+        if !result.spineOk                           { message = "Keep Your Body Straight!" }
+        else if !result.hipOk                        { message = "Raise Your Hips — They're Sagging!" }
+        else if result.neckTracked && !result.neckOk { message = "Keep Your Head Neutral!" }
 
         if let msg = message {
-            fireWatchNotification(title: "⚠️ Fix Your Form", body: msg, key: msg)
+            fireWatchNotification(title: "⚠️ Fix Your Form", body: msg)
+            speakFormCue(result: result)
         }
 
         DispatchQueue.main.async {
             if let msg = message {
-                if self.formAlertMessage != msg {
-                    self.formAlertMessage = msg
-                    self.alertTimer?.invalidate()
-                    self.alertTimer = Timer.scheduledTimer(withTimeInterval: 2.5, repeats: false) { _ in
-                        DispatchQueue.main.async { self.showFormAlert = false }
-                    }
-                }
-                self.showFormAlert = true
-            } else {
+                self.formAlertMessage = msg
+                self.showFormAlert    = true
                 self.alertTimer?.invalidate()
+                self.alertTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: false) { _ in
+                    DispatchQueue.main.async { self.showFormAlert = false }
+                }
+            } else {
                 self.showFormAlert = false
             }
         }
     }
 
-    // MARK: - Voice cues
-    private func speakFormCue(result: PushupResult) {
-        guard currentPhase == .descending || currentPhase == .bottom else { return }
-        let now = Date()
-        guard now.timeIntervalSince(lastSpeechTime) > 3.0 else { return }
-        var cue: String? = nil
-        if !result.spineOk    { cue = "Keep your back straight" }
-        else if !result.hipOk { cue = "Keep your hips level" }
-        if let text = cue, result.issue != lastSpokenIssue {
-            lastSpokenIssue = result.issue; lastSpeechTime = now
-            let u = AVSpeechUtterance(string: text); u.rate = 0.5; u.volume = 0.9
-            DispatchQueue.main.async { self.speechSynth.speak(u) }
-        }
-    }
-
-    private func speakRepCount(_ count: Int) {
-        let u = AVSpeechUtterance(string: "\(count)"); u.rate = 0.55; u.volume = 1.0
-        DispatchQueue.main.async { self.speechSynth.speak(u) }
-    }
-
-    private func speakText(_ text: String) {
-        let u = AVSpeechUtterance(string: text); u.rate = 0.5; u.volume = 1.0
-        DispatchQueue.main.async { self.speechSynth.speak(u) }
-    }
-
     // MARK: - Watch notification
-    func fireWatchNotification(title: String, body: String, key: String? = nil) {
-        let throttleKey = key ?? title
+    func fireWatchNotification(title: String, body: String) {
         let now = Date()
-        if let last = lastNotifTime[throttleKey], now.timeIntervalSince(last) < notifCooldown { return }
-        lastNotifTime[throttleKey] = now
+        if let last = lastNotifTime[title], now.timeIntervalSince(last) < notifCooldown { return }
+        lastNotifTime[title] = now
         NotificationManager.shared.send(title: title, body: body)
-        WatchConnectivityManager.shared.sendFormAlert(exercise: "Push-up", issue: "\(title): \(body)")
+        WatchConnectivityManager.shared.sendFormAlert(exercise: "Push-Up", issue: "\(title): \(body)")
     }
 
     // MARK: - Helpers
-    private func updateBodyPoints(_ pts: [VNHumanBodyPoseObservation.JointName: VNRecognizedPoint]) {
+    private func betterSide(_ points: [VNHumanBodyPoseObservation.JointName: VNRecognizedPoint]) -> Bool {
+        let lS = points[.leftShoulder]?.confidence  ?? 0
+        let lE = points[.leftElbow]?.confidence     ?? 0
+        let lW = points[.leftWrist]?.confidence     ?? 0
+        let lH = points[.leftHip]?.confidence       ?? 0
+        let lK = points[.leftKnee]?.confidence      ?? 0
+        let rS = points[.rightShoulder]?.confidence ?? 0
+        let rE = points[.rightElbow]?.confidence    ?? 0
+        let rW = points[.rightWrist]?.confidence    ?? 0
+        let rH = points[.rightHip]?.confidence      ?? 0
+        let rK = points[.rightKnee]?.confidence     ?? 0
+        let leftTotal:  Float = lS + lE + lW + lH + lK
+        let rightTotal: Float = rS + rE + rW + rH + rK
+        return leftTotal >= rightTotal
+    }
+
+    private func updateBodyPoints(_ points: [VNHumanBodyPoseObservation.JointName: VNRecognizedPoint]) {
         var mapped: [VNHumanBodyPoseObservation.JointName: CGPoint] = [:]
-        for (j, p) in pts where p.confidence > 0.3 {
-            mapped[j] = CGPoint(x: p.location.x, y: 1 - p.location.y)
+        for (joint, point) in points where point.confidence > 0.3 {
+            mapped[joint] = CGPoint(x: point.location.x, y: 1 - point.location.y)
         }
-        DispatchQueue.main.async { self.bodyPoints = mapped }
+        pointsBuffer.append(mapped)
+        if pointsBuffer.count > 6 { pointsBuffer.removeFirst() }
+
+        var smoothed: [VNHumanBodyPoseObservation.JointName: CGPoint] = [:]
+        let allJoints = Set(pointsBuffer.flatMap { $0.keys })
+        for joint in allJoints {
+            let positions = pointsBuffer.compactMap { $0[joint] }
+            guard !positions.isEmpty else { continue }
+            let n = CGFloat(positions.count)
+            smoothed[joint] = CGPoint(
+                x: positions.map(\.x).reduce(0, +) / n,
+                y: positions.map(\.y).reduce(0, +) / n
+            )
+        }
+        DispatchQueue.main.async { self.bodyPoints = smoothed }
     }
 
     private func calculateAngle(first: CGPoint, middle: CGPoint, last: CGPoint) -> Double {
-        let a = atan2(first.y - middle.y, first.x - middle.x)
-        let b = atan2(last.y  - middle.y, last.x  - middle.x)
+        let a = atan2(first.y  - middle.y, first.x  - middle.x)
+        let b = atan2(last.y   - middle.y, last.x   - middle.x)
         var angle = abs((a - b) * 180 / .pi)
         if angle > 180 { angle = 360 - angle }
         return angle
     }
 
-    private func smooth(_ r: PushupResult) -> (elbow: Double, hip: Double, spine: Double) {
-        angleBuffer.append((r.elbowAngle, r.hipAngle, r.spineAngle))
-        if angleBuffer.count > bufferSize { angleBuffer.removeFirst() }
-        let n = Double(angleBuffer.count)
-        return (angleBuffer.map(\.elbow).reduce(0,+) / n,
-                angleBuffer.map(\.hip).reduce(0,+)   / n,
-                angleBuffer.map(\.spine).reduce(0,+) / n)
+    private func smoothResult(_ result: PushUpResult) -> PushUpResult {
+        frameBuffer.append(result)
+        if frameBuffer.count > 8 { frameBuffer.removeFirst() }
+        let n = Double(frameBuffer.count)
+        var s = result
+        s.elbowAngle   = frameBuffer.map(\.elbowAngle).reduce(0,  +) / n
+        s.hipAngle     = frameBuffer.map(\.hipAngle).reduce(0,    +) / n
+        s.spineAngle   = frameBuffer.map(\.spineAngle).reduce(0,  +) / n
+        s.neckAngle    = frameBuffer.map(\.neckAngle).reduce(0,   +) / n
+        s.postureScore = Int(Double(frameBuffer.map(\.postureScore).reduce(0, +)) / n)
+        s.trackedLeftSide = result.trackedLeftSide
+        s.neckTracked     = result.neckTracked
+        let saggingCount = frameBuffer.filter { $0.spineSagging }.count
+        s.spineSagging = saggingCount > frameBuffer.count / 2
+        return s
+    }
+
+    // MARK: - Speech
+    private func speakRepCount(_ count: Int) {
+        let u = AVSpeechUtterance(string: "\(count)")
+        u.rate = 0.55; u.volume = 1.0
+        DispatchQueue.main.async { self.speechSynth.speak(u) }
+    }
+
+    private func speakText(_ text: String) {
+        let u = AVSpeechUtterance(string: text)
+        u.rate = 0.5; u.volume = 1.0
+        DispatchQueue.main.async { self.speechSynth.speak(u) }
     }
 }

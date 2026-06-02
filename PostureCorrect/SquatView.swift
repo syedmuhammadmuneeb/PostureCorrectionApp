@@ -91,6 +91,18 @@ struct SquatCameraView: View {
             if viewModel.showGoodRepFlash {
                 Color.green.opacity(0.2).ignoresSafeArea().allowsHitTesting(false)
             }
+
+            if viewModel.badRepMessage != nil {
+                Color.red.opacity(0.25).ignoresSafeArea().allowsHitTesting(false)
+                VStack {
+                    Spacer()
+                    Text(viewModel.badRepMessage ?? "")
+                        .font(.title3.bold()).foregroundColor(.white)
+                        .multilineTextAlignment(.center).padding()
+                        .background(Color.red.opacity(0.85)).cornerRadius(16)
+                        .padding(.bottom, 220)
+                }
+            }
         }
         .onAppear    { viewModel.start() }
         .onDisappear { viewModel.stop()  }
@@ -98,59 +110,75 @@ struct SquatCameraView: View {
         .sheet(isPresented: $showStatsSheet) { SquatStatsSheet(viewModel: viewModel) }
     }
 
-    // MARK: - Top bar
+    // MARK: - Top bar (minimal floating pill)
     private var topBar: some View {
-        HStack(spacing: 10) {
-            VStack(alignment: .leading, spacing: 2) {
-                Text("Squat AI").font(.title2.bold()).foregroundColor(.white)
-                Text(viewModel.sessionTimeString)
-                    .font(.caption.monospacedDigit()).foregroundColor(.green)
-            }
+        HStack(spacing: 8) {
+            Text(viewModel.sessionTimeString)
+                .font(.caption.monospacedDigit().bold())
+                .foregroundColor(.white)
+                .padding(.horizontal, 10).padding(.vertical, 6)
+                .background(.black.opacity(0.5)).cornerRadius(20)
+
             Spacer()
 
-            Button { showStatsSheet = true } label: {
-                Image(systemName: "chart.bar.fill").font(.title2).foregroundColor(.white)
-                    .padding(10).background(Color.white.opacity(0.2)).clipShape(Circle())
-            }
-            Button { showGoalSheet = true } label: {
-                Image(systemName: "target").font(.title2).foregroundColor(.white)
-                    .padding(10).background(Color.white.opacity(0.2)).clipShape(Circle())
-            }
-            Button { viewModel.switchCamera() } label: {
-                Image(systemName: "camera.rotate").font(.title2).foregroundColor(.white)
-                    .padding(10).background(Color.white.opacity(0.2)).clipShape(Circle())
-            }
-
             ZStack {
-                Circle().stroke(Color.white.opacity(0.2), lineWidth: 5).frame(width: 58, height: 58)
+                Circle().stroke(Color.white.opacity(0.15), lineWidth: 3).frame(width: 40, height: 40)
                 Circle()
                     .trim(from: 0, to: CGFloat(viewModel.postureResult.postureScore) / 100)
-                    .stroke(scoreColor, style: StrokeStyle(lineWidth: 5, lineCap: .round))
-                    .frame(width: 58, height: 58).rotationEffect(.degrees(-90))
-                Text("\(viewModel.postureResult.postureScore)").font(.headline.bold()).foregroundColor(.white)
+                    .stroke(scoreColor, style: StrokeStyle(lineWidth: 3, lineCap: .round))
+                    .frame(width: 40, height: 40).rotationEffect(.degrees(-90))
+                Text("\(viewModel.postureResult.postureScore)")
+                    .font(.system(size: 11, weight: .bold)).foregroundColor(.white)
             }
+
+            HStack(spacing: 4) {
+                Button { showStatsSheet = true } label: {
+                    Image(systemName: "chart.bar.fill").font(.subheadline).foregroundColor(.white)
+                        .padding(8).background(Color.white.opacity(0.15)).clipShape(Circle())
+                }
+                Button { showGoalSheet = true } label: {
+                    Image(systemName: "target").font(.subheadline).foregroundColor(.white)
+                        .padding(8).background(Color.white.opacity(0.15)).clipShape(Circle())
+                }
+                Button { viewModel.switchCamera() } label: {
+                    Image(systemName: "camera.rotate").font(.subheadline).foregroundColor(.white)
+                        .padding(8).background(Color.white.opacity(0.15)).clipShape(Circle())
+                }
+            }
+            .padding(.horizontal, 6).padding(.vertical, 4)
+            .background(.black.opacity(0.5)).cornerRadius(24)
         }
-        .padding().background(.black.opacity(0.65)).cornerRadius(20).padding()
+        .padding(.horizontal, 16).padding(.top, 8)
     }
 
-    // MARK: - Bottom panel
+    // MARK: - Bottom panel (compact)
     private var bottomPanel: some View {
-        VStack(spacing: 14) {
-            Text(viewModel.badRepMessage ?? viewModel.postureResult.issue.rawValue)
-                .font(.title2.bold())
-                .foregroundColor(viewModel.badRepMessage != nil ? .orange : .white)
-                .multilineTextAlignment(.center)
-                .animation(.easeInOut(duration: 0.2), value: viewModel.badRepMessage)
+        VStack(spacing: 10) {
 
-            HStack(spacing: 10) {
-                SquatAngleCard(title: "Knee", angle: viewModel.postureResult.kneeAngle,
-                               isOk: viewModel.postureResult.kneeOk,  idealRange: "50°-90°")
-                SquatAngleCard(title: "Hip",  angle: viewModel.postureResult.hipAngle,
-                               isOk: viewModel.postureResult.hipOk,   idealRange: "30°-100°")
-                SquatAngleCard(title: "Back", angle: viewModel.postureResult.spineAngle,
-                               isOk: viewModel.postureResult.spineOk, idealRange: "20°-55°")
+            // Issue label + phase pill
+            HStack {
+                Text(viewModel.postureResult.issue.rawValue)
+                    .font(.subheadline.bold()).foregroundColor(.white)
+                    .lineLimit(1).minimumScaleFactor(0.8)
+                Spacer()
+                Text(viewModel.phaseText)
+                    .font(.caption.bold())
+                    .foregroundColor(viewModel.phaseColor)
+                    .padding(.horizontal, 10).padding(.vertical, 4)
+                    .background(viewModel.phaseColor.opacity(0.15))
+                    .cornerRadius(12)
             }
 
+            // Angle chips
+            HStack(spacing: 6) {
+                SquatAngleChip(label: "Knee",  angle: viewModel.postureResult.kneeAngle,  isOk: viewModel.postureResult.kneeOk)
+                SquatAngleChip(label: "Hip",   angle: viewModel.postureResult.hipAngle,   isOk: viewModel.postureResult.hipOk)
+                SquatAngleChip(label: "Back",  angle: viewModel.postureResult.spineAngle, isOk: viewModel.postureResult.spineOk)
+                SquatAngleChip(label: "Ankle", angle: abs(viewModel.postureResult.kneeToeOffset * 100),
+                               isOk: viewModel.postureResult.ankleOk, unit: "")
+            }
+
+            // Progress bar (only when goal is set)
             if viewModel.targetReps > 0 {
                 SquatProgressBarView(
                     currentSet:  viewModel.currentSet,
@@ -160,35 +188,53 @@ struct SquatCameraView: View {
                 )
             }
 
-            HStack(spacing: 40) {
-                VStack(spacing: 2) {
+            // Rep count row
+            HStack(alignment: .center, spacing: 0) {
+                VStack(spacing: 0) {
                     Text("\(viewModel.repsInCurrentSet)")
-                        .font(.system(size: 48, weight: .bold)).foregroundColor(.white)
+                        .font(.system(size: 52, weight: .heavy, design: .rounded))
+                        .foregroundColor(.white)
                     Text(viewModel.targetReps > 0
-                         ? "SET \(viewModel.currentSet)/\(viewModel.targetSets)"
+                         ? "SET \(viewModel.currentSet) OF \(viewModel.targetSets)"
                          : "REPS")
-                        .font(.caption).foregroundColor(.white.opacity(0.7))
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundColor(.white.opacity(0.5))
+                        .kerning(1.2)
                 }
-                VStack(spacing: 2) {
-                    Text(viewModel.phaseText).font(.title3.bold()).foregroundColor(viewModel.phaseColor)
-                    Text("PHASE").font(.caption).foregroundColor(.white.opacity(0.7))
-                }
-                VStack(spacing: 2) {
+                .frame(maxWidth: .infinity)
+
+                Rectangle().fill(Color.white.opacity(0.1)).frame(width: 1, height: 44)
+
+                VStack(spacing: 4) {
                     HStack(spacing: 6) {
-                        Text("✅\(viewModel.goodReps)").foregroundColor(.green).bold()
-                        Text("❌\(viewModel.badReps)").foregroundColor(.red).bold()
-                    }.font(.subheadline)
-                    Text("QUALITY").font(.caption).foregroundColor(.white.opacity(0.7))
+                        Label("\(viewModel.goodReps)", systemImage: "checkmark.circle.fill")
+                            .foregroundColor(.green)
+                        Label("\(viewModel.badReps)", systemImage: "xmark.circle.fill")
+                            .foregroundColor(.red)
+                    }
+                    .font(.subheadline.bold())
+                    Text("QUALITY").font(.system(size: 10)).foregroundColor(.white.opacity(0.5)).kerning(1.2)
                 }
+                .frame(maxWidth: .infinity)
+
+                Rectangle().fill(Color.white.opacity(0.1)).frame(width: 1, height: 44)
+
                 Button { viewModel.resetSession() } label: {
-                    VStack(spacing: 2) {
-                        Image(systemName: "arrow.counterclockwise").font(.title2).foregroundColor(.white)
-                        Text("RESET").font(.caption).foregroundColor(.white.opacity(0.7))
+                    VStack(spacing: 4) {
+                        Image(systemName: "arrow.counterclockwise")
+                            .font(.title3).foregroundColor(.white.opacity(0.7))
+                        Text("RESET").font(.system(size: 10)).foregroundColor(.white.opacity(0.4)).kerning(1.2)
                     }
                 }
+                .frame(maxWidth: .infinity)
             }
+            .padding(.top, 2)
         }
-        .padding().background(.black.opacity(0.75)).cornerRadius(22).padding()
+        .padding(.horizontal, 18).padding(.vertical, 14)
+        .background(.ultraThinMaterial.opacity(0.95))
+        .background(Color.black.opacity(0.6))
+        .cornerRadius(24)
+        .padding(.horizontal, 12).padding(.bottom, 8)
     }
 
     private var scoreColor: Color {
@@ -200,6 +246,24 @@ struct SquatCameraView: View {
 }
 
 // MARK: - SUPPORTING VIEWS
+
+struct SquatAngleChip: View {
+    let label: String
+    let angle: Double
+    let isOk:  Bool
+    var unit:  String = "°"
+
+    var body: some View {
+        HStack(spacing: 4) {
+            Circle().fill(isOk ? Color.green : Color.red).frame(width: 6, height: 6)
+            Text(label).font(.system(size: 10, weight: .medium)).foregroundColor(.white.opacity(0.6))
+            Text("\(Int(angle))\(unit)").font(.system(size: 12, weight: .bold)).foregroundColor(isOk ? .green : .red)
+        }
+        .padding(.horizontal, 8).padding(.vertical, 5)
+        .background(isOk ? Color.green.opacity(0.1) : Color.red.opacity(0.1))
+        .cornerRadius(10)
+    }
+}
 
 struct SquatProgressBarView: View {
     let currentSet: Int; let totalSets: Int; let repsInSet: Int; let targetReps: Int
@@ -214,7 +278,7 @@ struct SquatProgressBarView: View {
                 ZStack(alignment: .leading) {
                     RoundedRectangle(cornerRadius: 6).fill(Color.white.opacity(0.15)).frame(height: 10)
                     RoundedRectangle(cornerRadius: 6).fill(Color.green)
-                        .frame(width: geo.size.width * CGFloat(min(repsInSet, targetReps)) / CGFloat(max(targetReps,1)),
+                        .frame(width: geo.size.width * CGFloat(min(repsInSet, targetReps)) / CGFloat(max(targetReps, 1)),
                                height: 10)
                         .animation(.spring(response: 0.3), value: repsInSet)
                 }
@@ -249,20 +313,6 @@ struct SquatFormAlertBanner: View {
         .background(Color.black.opacity(0.85)).cornerRadius(30)
         .overlay(RoundedRectangle(cornerRadius: 30).stroke(Color.orange, lineWidth: 1.5))
         .shadow(color: .orange.opacity(0.4), radius: 8).padding(.horizontal)
-    }
-}
-
-struct SquatAngleCard: View {
-    let title: String; let angle: Double; let isOk: Bool; let idealRange: String
-    var body: some View {
-        VStack(spacing: 5) {
-            Text(title).font(.caption).foregroundColor(.white.opacity(0.7))
-            Text("\(Int(angle))°").font(.headline.bold()).foregroundColor(isOk ? .green : .red)
-            Text(idealRange).font(.caption2).foregroundColor(.white.opacity(0.5))
-        }
-        .frame(maxWidth: .infinity).padding(.vertical, 10)
-        .background(isOk ? Color.green.opacity(0.15) : Color.red.opacity(0.15))
-        .cornerRadius(12)
     }
 }
 
@@ -490,7 +540,7 @@ final class SquatViewModel: NSObject, ObservableObject,
     private var sessionStartDate: Date?
     private var sessionTimer: Timer?
 
-    @Published var reps = 0   // total this session
+    @Published var reps = 0
 
     private var frameBuffer:        [SquatResult] = []
     private var lastKneeAngle:      Double = 180
@@ -518,7 +568,6 @@ final class SquatViewModel: NSObject, ObservableObject,
     private var lastSpokenIssue: SquatIssue = .detecting
     private var lastSpeechTime:  Date = .distantPast
 
-    // Watch notification throttle
     private var lastNotifTime: [String: Date] = [:]
     private let notifCooldown: TimeInterval   = 5.0
 
@@ -529,7 +578,6 @@ final class SquatViewModel: NSObject, ObservableObject,
             DispatchQueue.global(qos: .userInitiated).async { self.setupCamera() }
         }
         startSessionTimer()
-        // ── Watch notification: exercise started ─────────────────────────────
         fireWatchNotification(title: "🏋️ Ready for Squat!", body: "Get into position and begin.")
     }
 
@@ -539,7 +587,6 @@ final class SquatViewModel: NSObject, ObservableObject,
         restTimer?.invalidate()
     }
 
-    // MARK: - Session timer
     private func startSessionTimer() {
         sessionStartDate = Date()
         sessionTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
@@ -551,7 +598,6 @@ final class SquatViewModel: NSObject, ObservableObject,
         }
     }
 
-    // MARK: - Goal
     func setGoal(sets: Int, reps: Int, restSeconds: Int) {
         DispatchQueue.main.async {
             self.targetSets = sets; self.targetReps = reps
@@ -567,7 +613,6 @@ final class SquatViewModel: NSObject, ObservableObject,
         }
     }
 
-    // MARK: - Reset
     func resetSession() {
         DispatchQueue.main.async {
             self.reps = 0; self.repsInCurrentSet = 0; self.currentSet = 1
@@ -668,7 +713,6 @@ final class SquatViewModel: NSObject, ObservableObject,
         } catch { print(error) }
     }
 
-    // MARK: - Voice cues
     private func speakFormCue(result: SquatResult) {
         guard currentPhase == .descending || currentPhase == .bottom else { return }
         let now = Date()
@@ -694,7 +738,6 @@ final class SquatViewModel: NSObject, ObservableObject,
         DispatchQueue.main.async { self.speechSynth.speak(u) }
     }
 
-    // MARK: - Form alert (fires watch notification for real-time errors)
     private func updateFormAlert(result: SquatResult) {
         guard currentPhase == .descending || currentPhase == .bottom else {
             DispatchQueue.main.async { self.showFormAlert = false }
@@ -706,7 +749,6 @@ final class SquatViewModel: NSObject, ObservableObject,
         else if !result.hipOk   { message = "Lower Your Hips More!" }
 
         if let msg = message {
-            // ── Watch notification: real-time form error ─────────────────────
             fireWatchNotification(title: "⚠️ Fix Your Form", body: msg)
         }
 
@@ -797,7 +839,6 @@ final class SquatViewModel: NSObject, ObservableObject,
                         self.repsInCurrentSet = 0
                     } else {
                         self.speakText("Workout complete! Great job!")
-                        // ── Watch notification: workout completed ────────────
                         self.fireWatchNotification(
                             title: "🎉 Workout Complete!",
                             body:  "You finished all \(self.targetSets) sets. Great job!"
@@ -830,7 +871,6 @@ final class SquatViewModel: NSObject, ObservableObject,
         }
     }
 
-    // MARK: - Rest timer
     private func startRestTimer() {
         restSecondsLeft = restDuration; isResting = true
         restTimer?.invalidate()
@@ -846,7 +886,6 @@ final class SquatViewModel: NSObject, ObservableObject,
         }
     }
 
-    // MARK: - Feedback
     private func triggerGoodRepFeedback(score: Int) {
         DispatchQueue.main.async {
             self.showGoodRepFlash = true
@@ -860,14 +899,13 @@ final class SquatViewModel: NSObject, ObservableObject,
         if hadAnkleError  { reasons.append("Knees too forward") }
         if hadHipError    { reasons.append("Hips too high") }
         if reasons.isEmpty { reasons.append("Improper Depth") }
-        let message = "⚠️ " + reasons.joined(separator: " • ")
+        let message = "⚠️ Rep Not Counted\n" + reasons.joined(separator: " • ")
 
         if hadSpineError       { speakText("Keep your back straight") }
         else if hadAnkleError  { speakText("Knees too far forward") }
         else if hadHipError    { speakText("Lower your hips") }
         else                   { speakText("Improper Depth") }
 
-        // ── Watch notification: bad rep ──────────────────────────────────────
         fireWatchNotification(title: "❌ You Did It Wrong!", body: reasons.joined(separator: " • "))
 
         DispatchQueue.main.async {
@@ -881,21 +919,13 @@ final class SquatViewModel: NSObject, ObservableObject,
         }
     }
 
-    // MARK: - Watch notification (fires both local notification + WatchConnectivity)
     func fireWatchNotification(title: String, body: String) {
         let key = "\(title)"
         let now = Date()
         if let last = lastNotifTime[key], now.timeIntervalSince(last) < notifCooldown { return }
         lastNotifTime[key] = now
-
-        // 1. Local notification — shows on iPhone + mirrors to watch
         NotificationManager.shared.send(title: title, body: body)
-
-        // 2. WatchConnectivity — direct message to watch app for instant haptic
-        WatchConnectivityManager.shared.sendFormAlert(
-            exercise: "Squat",
-            issue:    "\(title): \(body)"
-        )
+        WatchConnectivityManager.shared.sendFormAlert(exercise: "Squat", issue: "\(title): \(body)")
     }
 
     // MARK: - Posture analysis (original logic preserved exactly)
